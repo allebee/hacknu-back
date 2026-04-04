@@ -74,3 +74,21 @@ class ChatMessage(Base):
     __table_args__ = (
         Index("idx_chat_messages_agent", "agent_id", "created_at"),
     )
+
+
+class MeetingTranscript(Base):
+    __tablename__ = "meeting_transcripts"
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), primary_key=True, default=uuid.uuid4
+    )
+    room_id: Mapped[str] = mapped_column(String(255), nullable=False)
+    speaker: Mapped[str] = mapped_column(String(255), nullable=False, default="Unknown")
+    text: Mapped[str] = mapped_column(Text, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=lambda: datetime.now(timezone.utc)
+    )
+
+    __table_args__ = (
+        Index("idx_meeting_transcripts_room", "room_id", "created_at"),
+    )

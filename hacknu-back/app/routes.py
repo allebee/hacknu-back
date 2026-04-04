@@ -1,5 +1,5 @@
 """
-API route handlers — all 6 endpoints.
+API route handlers.
 """
 
 from __future__ import annotations
@@ -29,9 +29,14 @@ from app.schemas import (
     MessagesResponse,
     TextEntry,
     ChangeEntry,
+    TranscriptPostRequest,
+    TranscriptPostResponse,
+    TranscriptGetResponse,
+    TranscriptDeleteResponse,
 )
 from app.liveblocks import liveblocks
 from app.planner import generate_operations, generate_query_answer
+from app.transcript import store_chunks, get_meeting_context, get_transcript_entries, clear_transcript
 
 logger = logging.getLogger(__name__)
 
@@ -42,6 +47,7 @@ DbDep = Annotated[AsyncSession, Depends(get_db)]
 complete_router = APIRouter(tags=["complete"])
 agents_router = APIRouter(tags=["agents"])
 agent_router = APIRouter(tags=["agent"])
+transcript_router = APIRouter(tags=["transcript"])
 
 
 # ───────────────────────────────────────────────────────────────────────
@@ -88,7 +94,11 @@ async def autocomplete(req: CompleteRequest, db: DbDep):
     rejected = [{"reasoning": r.reasoning, "operations": r.operations} for r in result.scalars()]
 
     # Generate operations
-    operations, reasoning = await generate_operations(storage, rejected_ops=rejected)
+    operations, reasoning = await generate_operations(
+        storage,
+        rejected_ops=rejected,
+        meeting_context=await get_meeting_context(db, req.room_id),
+    )
 
     if not operations:
         await liveblocks.set_presence(req.room_id, agent_id, "idle", ttl=5)
@@ -380,7 +390,10 @@ async def run_agent(agent_id: str, req: AgentRunRequest, db: DbDep):
     db.add(user_msg)
 
     if req.mode == "query":
-        answer, refs = await generate_query_answer(storage, req.prompt, chat_history)
+        answer, refs = await generate_query_answer(
+            storage, req.prompt, chat_history,
+            meeting_context=await get_meeting_context(db, req.room_id),
+        )
         assistant_msg = ChatMessage(
             agent_id=agent_id,
             type="text",
@@ -409,6 +422,7 @@ async def run_agent(agent_id: str, req: AgentRunRequest, db: DbDep):
         user_prompt=req.prompt,
         rejected_ops=rejected,
         chat_history=chat_history,
+        meeting_context=await get_meeting_context(db, req.room_id),
     )
 
     # Save assistant text reply
@@ -525,3 +539,35 @@ async def get_messages(
             ))
 
     return MessagesResponse(messages=entries)
+
+
+# ───────────────────────────────────────────────────────────────────────
+# Transcript endpoints — POST/GET/DELETE /rooms/{room_id}/transcript
+# ───────────────────────────────────────────────────────────────────────
+
+@transcript_router.post("/rooms/{room_id}/transcript", response_model=TranscriptPostResponse)
+async def post_transcript(room_id: str, req: TranscriptPostRequest, db: DbDep):
+    """Receive transcript chunks from Chrome extension or manual paste."""
+    chunks = [c.model_dump() for c in req.chunks]
+    count = await store_chunks(db, room_id, chunks)
+    return TranscriptPostResponse(room_id=room_id, stored_count=count)
+
+
+@transcript_router.get("/rooms/{room_id}/transcript", response_model=TranscriptGetResponse)
+async def get_transcript(room_id: str, db: DbDep):
+    """Get transcript entries and summary for a room."""
+    entries = await get_transcript_entries(db, room_id)
+    summary = await get_meeting_context(db, room_id)
+    return TranscriptGetResponse(
+        room_id=room_id,
+        entry_count=len(entries),
+        entries=entries,
+        summary=summary,
+    )
+
+
+@transcript_router.delete("/rooms/{room_id}/transcript", response_model=TranscriptDeleteResponse)
+async def delete_transcript(room_id: str, db: DbDep):
+    """Clear all transcript data for a room."""
+    count = await clear_transcript(db, room_id)
+    return TranscriptDeleteResponse(room_id=room_id, deleted_count=count)

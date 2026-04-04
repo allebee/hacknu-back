@@ -187,12 +187,17 @@ def _build_context(
     rejected_ops: list[dict] | None = None,
     user_prompt: str = "",
     chat_history: list[dict] | None = None,
+    meeting_context: str | None = None,
 ) -> str:
-    """Build a compact context string from storage + history."""
+    """Build a compact context string from storage + history + meeting."""
     parts = []
 
     if user_prompt:
         parts.append(f"USER REQUEST: {user_prompt}")
+
+    # Meeting context (from Google Meet transcript)
+    if meeting_context:
+        parts.append(meeting_context)
 
     # Current shapes on canvas
     shapes = storage.get("shapes", {})
@@ -258,12 +263,13 @@ async def generate_operations(
     user_prompt: str = "",
     rejected_ops: list[dict] | None = None,
     chat_history: list[dict] | None = None,
+    meeting_context: str | None = None,
 ) -> tuple[list[dict], str]:
     """
     Call LLM and return (operations_list, reasoning).
     """
     client, model = _get_client()
-    context = _build_context(storage, rejected_ops, user_prompt, chat_history)
+    context = _build_context(storage, rejected_ops, user_prompt, chat_history, meeting_context)
 
     logger.info(f"[Planner] model={model} context_len={len(context)}")
 
@@ -275,7 +281,7 @@ async def generate_operations(
                 {"role": "user", "content": context},
             ],
             temperature=0.7,
-            max_tokens=4096,
+            max_tokens=8192,
             response_format={"type": "json_object"},
         )
         raw = response.choices[0].message.content or "{}"
@@ -297,12 +303,13 @@ async def generate_query_answer(
     storage: dict,
     user_prompt: str,
     chat_history: list[dict] | None = None,
+    meeting_context: str | None = None,
 ) -> tuple[str, list[str]]:
     """
     Answer a question about the canvas. Returns (answer, referenced_shape_ids).
     """
     client, model = _get_client()
-    context = _build_context(storage, user_prompt=user_prompt, chat_history=chat_history)
+    context = _build_context(storage, user_prompt=user_prompt, chat_history=chat_history, meeting_context=meeting_context)
 
     query_prompt = (
         "You are an AI canvas assistant. Answer the user's question about the current "

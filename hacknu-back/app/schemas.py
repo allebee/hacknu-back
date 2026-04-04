@@ -119,3 +119,31 @@ ChatEntry = Union[TextEntry, ChangeEntry]
 
 class MessagesResponse(BaseModel):
     messages: list[ChatEntry]
+
+
+# ── Transcript endpoints ───────────────────────────────────────────────
+
+class TranscriptChunk(BaseModel):
+    speaker: str = "Unknown"
+    text: str
+
+
+class TranscriptPostRequest(BaseModel):
+    chunks: list[TranscriptChunk]
+
+
+class TranscriptPostResponse(BaseModel):
+    room_id: str
+    stored_count: int
+
+
+class TranscriptGetResponse(BaseModel):
+    room_id: str
+    entry_count: int
+    entries: list[dict]
+    summary: str | None = None
+
+
+class TranscriptDeleteResponse(BaseModel):
+    room_id: str
+    deleted_count: int

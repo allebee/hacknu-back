@@ -1,0 +1,18 @@
+{
+  "manifest_version": 3,
+  "name": "Canvas Meet Sync",
+  "version": "1.0.0",
+  "description": "Captures Google Meet captions and syncs them to your AI Canvas room",
+  "permissions": ["activeTab", "storage"],
+  "host_permissions": ["https://meet.google.com/*"],
+  "content_scripts": [
+    {
+      "matches": ["https://meet.google.com/*"],
+      "js": ["content.js"],
+      "run_at": "document_idle"
+    }
+  ],
+  "action": {
+    "default_popup": "popup.html"
+  }
+}
