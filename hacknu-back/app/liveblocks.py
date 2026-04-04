@@ -33,13 +33,47 @@ class LiveblocksClient:
             return r.json()
 
     async def patch_storage(self, room_id: str, operations: list[dict]) -> None:
-        """PATCH /v2/rooms/{roomId}/storage/json-patch (RFC 6902)"""
+        """PATCH /v2/rooms/{roomId}/storage/json-patch (RFC 6902)
+
+        Auto-creates missing parent keys on 422 and retries once.
+        """
         async with httpx.AsyncClient(timeout=30) as client:
             r = await client.patch(
                 f"{self.BASE}/rooms/{room_id}/storage/json-patch",
                 json=operations,
                 headers=self._headers,
             )
+            if r.status_code == 422:
+                # Try to create missing parent keys and retry
+                body = r.json()
+                msg = body.get("message", "")
+                # e.g. "Add failed: Path pendingChanges/chg_xxx does not exist"
+                if "does not exist" in msg:
+                    missing_parents = set()
+                    for op in operations:
+                        path = op.get("path", "")
+                        parts = path.strip("/").split("/")
+                        if len(parts) >= 2:
+                            missing_parents.add(f"/{parts[0]}")
+                    if missing_parents:
+                        # Create each missing parent as empty LiveObject
+                        init_ops = [
+                            {"op": "add", "path": p, "value": {}}
+                            for p in missing_parents
+                        ]
+                        init_r = await client.patch(
+                            f"{self.BASE}/rooms/{room_id}/storage/json-patch",
+                            json=init_ops,
+                            headers=self._headers,
+                        )
+                        # Ignore errors if parent already exists (race condition)
+                        if init_r.is_success:
+                            # Retry the original patch
+                            r = await client.patch(
+                                f"{self.BASE}/rooms/{room_id}/storage/json-patch",
+                                json=operations,
+                                headers=self._headers,
+                            )
             r.raise_for_status()
 
     # ── Presence ───────────────────────────────────────────────────────
