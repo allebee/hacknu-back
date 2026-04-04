@@ -1,0 +1,10 @@
+fastapi
+uvicorn[standard]
+pydantic>=2.0
+openai>=1.0
+python-dotenv
+httpx
+sqlalchemy[asyncio]>=2.0
+asyncpg
+alembic
+psycopg2-binary

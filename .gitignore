@@ -1,0 +1,42 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+*.egg-info/
+*.egg
+dist/
+build/
+*.whl
+
+# Virtual environments
+venv/
+.venv/
+env/
+
+# Environment variables
+.env
+.env.*
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# pytest
+.pytest_cache/
+htmlcov/
+.coverage
+.coverage.*
+
+# Alembic
+alembic/versions/__pycache__/
+
+# Docker
+*.log
+
+# Gemini / Agent artifacts
+.gemini/
