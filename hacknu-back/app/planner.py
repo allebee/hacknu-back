@@ -15,6 +15,9 @@ from app.config import AGENT_PROVIDER, AGENT_MODEL, OPENAI_API_KEY, GEMINI_API_K
 
 logger = logging.getLogger(__name__)
 
+MAX_HISTORY_MESSAGES = 60
+MAX_HISTORY_CHARS = 6000
+
 SYSTEM_PROMPT = """You are an AI canvas assistant for a collaborative whiteboard.
 You can either:
 1. respond in chat only, or
@@ -64,6 +67,7 @@ Use NO canvas operations for:
 - ambiguous prompts where the user has not clearly asked to change the canvas
 
 Never turn simple messages like "hello", "thanks", or "what do you think?" into stickers, notes, or text shapes.
+Short confirmations are NOT ambiguous when the recent chat context already establishes the intended canvas action.
 
 Only return canvas operations when the user clearly wants the board changed, for example:
 - create, add, draw, sketch, diagram, map, visualize, or lay out something on the canvas
@@ -73,7 +77,10 @@ Only return canvas operations when the user clearly wants the board changed, for
 When canvas changes are needed:
 - make the minimum useful set of changes
 - prefer updating existing shapes over adding redundant ones
-- if the request is underspecified, ask a clarifying question in `reasoning` and leave `operations` empty
+- if the request is straightforward, proceed with sensible defaults instead of asking unnecessary follow-up questions
+- if the user confirms a previously discussed canvas action with messages like "confirm", "do it", "yes", or "go ahead", treat that as approval and execute the previously discussed canvas change
+- never ask for confirmation again if the recent chat history already contains a clear confirmation
+- only ask a clarifying question in `reasoning` and leave `operations` empty when a necessary detail is genuinely missing
 - do not force a canvas change just because canvas context exists
 
 You think like a visual designer when a visual output is actually needed: group related concepts, use visual hierarchy, and create clear spatial layouts.
@@ -119,6 +126,80 @@ EXAMPLE — User says "hello":
 {
   "operations": [],
   "reasoning": "Hello! How can I help with the canvas or your ideas?"
+}
+```
+
+EXAMPLE — User says "create sticker go!!!":
+```json
+{
+  "operations": [
+    {
+      "op": "add_shape",
+      "shape": {
+        "id": "shape:go_sticker",
+        "type": "note",
+        "x": 200,
+        "y": 200,
+        "rotation": 0,
+        "index": "a1",
+        "parentId": "page:page",
+        "isLocked": false,
+        "opacity": 1,
+        "meta": {},
+        "props": {
+          "color": "yellow",
+          "labelColor": "black",
+          "size": "m",
+          "font": "sans",
+          "fontSizeAdjustment": 0,
+          "align": "middle",
+          "verticalAlign": "middle",
+          "growY": 0,
+          "url": "",
+          "richText": {"type":"doc","content":[{"type":"paragraph","content":[{"type":"text","text":"go!!!"}]}]},
+          "scale": 1
+        }
+      }
+    }
+  ],
+  "reasoning": "Added a sticker saying 'go!!!' to the canvas."
+}
+```
+
+EXAMPLE — Assistant asked for confirmation in the prior turn, user now says "do it":
+```json
+{
+  "operations": [
+    {
+      "op": "add_shape",
+      "shape": {
+        "id": "shape:confirmed_request",
+        "type": "note",
+        "x": 200,
+        "y": 200,
+        "rotation": 0,
+        "index": "a1",
+        "parentId": "page:page",
+        "isLocked": false,
+        "opacity": 1,
+        "meta": {},
+        "props": {
+          "color": "yellow",
+          "labelColor": "black",
+          "size": "m",
+          "font": "sans",
+          "fontSizeAdjustment": 0,
+          "align": "middle",
+          "verticalAlign": "middle",
+          "growY": 0,
+          "url": "",
+          "richText": {"type":"doc","content":[{"type":"paragraph","content":[{"type":"text","text":"previously requested content"}]}]},
+          "scale": 1
+        }
+      }
+    }
+  ],
+  "reasoning": "Applied the change we discussed."
 }
 ```
 
@@ -233,6 +314,7 @@ def _build_context(
     chat_history: list[dict] | None = None,
     meeting_context: str | None = None,
     request_mode: str = "chat_generate",
+    include_full_storage: bool = False,
 ) -> str:
     """Build a compact context string from storage + history + meeting."""
     parts = [f"REQUEST MODE: {request_mode}"]
@@ -282,6 +364,10 @@ def _build_context(
     else:
         parts.append("CURRENT CANVAS: empty")
 
+    if include_full_storage:
+        parts.append("FULL CANVAS STORAGE JSON:")
+        parts.append(json.dumps(storage, ensure_ascii=True, separators=(",", ":")))
+
     # Rejected history — include both reasoning and what shapes were rejected
     if rejected_ops:
         parts.append("PREVIOUSLY REJECTED (DO NOT regenerate these or similar):")
@@ -297,8 +383,26 @@ def _build_context(
     # Chat history
     if chat_history:
         parts.append("RECENT CHAT CONTEXT:")
-        for msg in chat_history[-10:]:
-            parts.append(f"  [{msg['role']}]: {msg['content'][:200]}")
+        total_chars = 0
+        selected_messages: list[str] = []
+        for msg in reversed(chat_history[-MAX_HISTORY_MESSAGES:]):
+            role = msg.get("role", "assistant")
+            msg_type = msg.get("type", "text")
+            if msg_type == "change":
+                status = msg.get("change_status", "pending")
+                summary = (msg.get("operations_summary") or "")[:240]
+                content = f"[change:{status}] {summary}".strip()
+            else:
+                content = (msg.get("content") or "")[:500]
+
+            line = f"  [{role}]: {content}"
+            if selected_messages and total_chars + len(line) > MAX_HISTORY_CHARS:
+                break
+            selected_messages.append(line)
+            total_chars += len(line)
+
+        for line in reversed(selected_messages):
+            parts.append(line)
 
     return "\n".join(parts)
 
@@ -310,6 +414,7 @@ async def generate_operations(
     chat_history: list[dict] | None = None,
     meeting_context: str | None = None,
     request_mode: str = "chat_generate",
+    include_full_storage: bool = False,
 ) -> tuple[list[dict], str]:
     """
     Call LLM and return (operations_list, reasoning).
@@ -322,6 +427,7 @@ async def generate_operations(
         chat_history,
         meeting_context,
         request_mode,
+        include_full_storage,
     )
 
     logger.info(f"[Planner] model={model} context_len={len(context)}")
@@ -357,12 +463,19 @@ async def generate_query_answer(
     user_prompt: str,
     chat_history: list[dict] | None = None,
     meeting_context: str | None = None,
+    include_full_storage: bool = False,
 ) -> tuple[str, list[str]]:
     """
     Answer a question about the canvas. Returns (answer, referenced_shape_ids).
     """
     client, model = _get_client()
-    context = _build_context(storage, user_prompt=user_prompt, chat_history=chat_history, meeting_context=meeting_context)
+    context = _build_context(
+        storage,
+        user_prompt=user_prompt,
+        chat_history=chat_history,
+        meeting_context=meeting_context,
+        include_full_storage=include_full_storage,
+    )
 
     query_prompt = (
         "You are an AI canvas assistant. Answer the user's question about the current "

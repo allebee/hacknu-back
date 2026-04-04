@@ -423,14 +423,29 @@ async def run_agent(agent_id: str, req: AgentRunRequest, db: DbDep):
     # Get chat history
     result = await db.execute(
         select(ChatMessage)
-        .where(ChatMessage.agent_id == agent_id, ChatMessage.type == "text")
+        .where(ChatMessage.agent_id == agent_id)
         .order_by(ChatMessage.created_at.desc())
-        .limit(20)
+        .limit(100)
     )
-    chat_history = [
-        {"role": m.role, "content": m.content}
-        for m in reversed(result.scalars().all())
-    ]
+    chat_history = []
+    for m in reversed(result.scalars().all()):
+        if m.type == "change":
+            chat_history.append(
+                {
+                    "type": "change",
+                    "role": "assistant",
+                    "change_status": m.change_status,
+                    "operations_summary": m.operations_summary,
+                }
+            )
+        else:
+            chat_history.append(
+                {
+                    "type": "text",
+                    "role": m.role,
+                    "content": m.content,
+                }
+            )
 
     # Save user message
     user_msg = ChatMessage(
@@ -445,6 +460,7 @@ async def run_agent(agent_id: str, req: AgentRunRequest, db: DbDep):
         answer, refs = await generate_query_answer(
             storage, req.prompt, chat_history,
             meeting_context=await get_meeting_context(db, req.room_id),
+            include_full_storage=True,
         )
         assistant_msg = ChatMessage(
             agent_id=agent_id,
@@ -476,6 +492,7 @@ async def run_agent(agent_id: str, req: AgentRunRequest, db: DbDep):
         chat_history=chat_history,
         meeting_context=await get_meeting_context(db, req.room_id),
         request_mode="chat_generate",
+        include_full_storage=True,
     )
 
     # Save assistant text reply
