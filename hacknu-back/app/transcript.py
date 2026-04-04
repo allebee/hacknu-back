@@ -73,6 +73,9 @@ async def get_meeting_context(
     if not entries:
         return None
 
+    # Deduplicate progressive captions (interim → final)
+    entries = _dedup_progressive(entries)
+
     parts = []
 
     # Summary (cached)
@@ -88,6 +91,32 @@ async def get_meeting_context(
             parts.append(f"  [{e.speaker}]: {e.text}")
 
     return "\n".join(parts)
+
+
+def _dedup_progressive(entries: list[MeetingTranscript]) -> list[MeetingTranscript]:
+    """
+    Remove progressive/interim speech entries.
+
+    Google Meet captions grow in-place: "Hello" → "Hello, how" → "Hello, how are you?"
+    Each poll captures the growing text, so entry N is often a prefix of entry N+1.
+    Keep only the LAST (longest) version of each progressive block.
+    """
+    if len(entries) <= 1:
+        return entries
+
+    result = []
+    for i, entry in enumerate(entries):
+        # Check if the NEXT entry (same speaker) starts with this entry's text
+        if i + 1 < len(entries):
+            next_entry = entries[i + 1]
+            if (
+                next_entry.speaker == entry.speaker
+                and next_entry.text.startswith(entry.text[:20])  # fuzzy prefix match
+            ):
+                continue  # skip — next entry is a longer version
+        result.append(entry)
+
+    return result
 
 
 async def _get_or_create_summary(
