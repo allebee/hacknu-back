@@ -16,6 +16,7 @@ from app.config import AGENT_PROVIDER, AGENT_MODEL, OPENAI_API_KEY, GEMINI_API_K
 logger = logging.getLogger(__name__)
 
 SYSTEM_PROMPT = """You are an AI canvas assistant that generates shapes for a collaborative whiteboard.
+You think like a visual designer: group related concepts, use visual hierarchy, and create clear spatial layouts.
 
 Given the current canvas state and user context, generate shape operations.
 Return a JSON object with:
@@ -25,9 +26,15 @@ Return a JSON object with:
       "op": "add_shape",
       "shape": {
         "id": "shape:<unique_id>",
-        "type": "<geo|arrow|note|text|frame>",
+        "type": "<geo|arrow|note|text|frame|line|draw|group>",
         "x": <number>,
         "y": <number>,
+        "rotation": 0,
+        "index": "a1",
+        "parentId": "page:page",
+        "isLocked": false,
+        "opacity": 1,
+        "meta": {},
         "props": { ... type-specific props ... }
       }
     }
@@ -35,24 +42,123 @@ Return a JSON object with:
   "reasoning": "short explanation"
 }
 
+Other supported operations:
+- { "op": "delete_shape", "shapeId": "shape:xxx" }
+- { "op": "update_shape", "shapeId": "shape:xxx", "updates": { "props": { ... partial ... } } }
+
 Shape types and their required props:
-- geo: { geo, w, h, color, fill, dash, size, font, align, verticalAlign, richText, labelColor, scale }
-  - geo values: rectangle, ellipse, triangle, diamond, pentagon, hexagon, octagon, star, cloud, heart
-- arrow: { kind, start: {x,y}, end: {x,y}, bend, color, dash, size, arrowheadStart, arrowheadEnd, richText, scale }
-- note: { color, size, font, align, verticalAlign, richText, scale }
+- geo: { geo, w, h, color, fill, dash, size, font, align, verticalAlign, richText, labelColor, url, growY, scale }
+  - geo values: rectangle, ellipse, triangle, diamond, pentagon, hexagon, octagon, star, cloud, heart, rhombus, oval, trapezoid, x-box, check-box
+- arrow: { kind, start: {x,y}, end: {x,y}, bend, color, fill, dash, size, font, arrowheadStart, arrowheadEnd, labelColor, labelPosition, richText, scale }
+  - kind: "arc" (curved) or "elbow" (right-angle)
+- note: { color, labelColor, size, font, fontSizeAdjustment, align, verticalAlign, growY, url, richText, scale }
 - text: { color, size, font, textAlign, w, richText, scale, autoSize }
 - frame: { w, h, name, color }
+- line: { color, dash, size, spline, points, scale }
+- draw: { color, fill, dash, size, segments, isComplete, isClosed, isPen, scale }
+- group: {} (children reference group via parentId)
 
 Color values: black, grey, light-violet, violet, blue, light-blue, yellow, orange, green, light-green, light-red, red, white
 Fill values: none, semi, solid, pattern
 Size values: s, m, l, xl
 Font values: draw, sans, serif, mono
 
-For richText, use Prosemirror format:
+For richText, ALWAYS use Prosemirror format:
 { "type": "doc", "content": [{ "type": "paragraph", "content": [{ "type": "text", "text": "your text" }] }] }
 
-Generate at most 20 shapes. Place shapes in visible viewport area.
-Do NOT regenerate shapes that were previously rejected (listed in context).
+SPATIAL LAYOUT RULES:
+- Viewport area is roughly (0,0) to (1600,900). Place shapes within this range.
+- Default geo size: w=200, h=100. Notes are ~200x200. Text: w=200.
+- Leave at least 40px gap between shapes to avoid overlap.
+- When adding shapes near existing ones, check their positions AND sizes from the context.
+- For arrows connecting two shapes: set start to the center of the source shape, end to the center of the target shape.
+  Example: source at (100,200) size 200x100 → arrow start = {x:200, y:250}. Target at (500,200) size 200x100 → arrow end = {x:500, y:250}.
+- Arrange related shapes in logical flows: left-to-right, top-to-bottom, or radial.
+- Use frames to group related concepts when generating 5+ shapes.
+
+Generate at most 20 shapes. Do NOT regenerate shapes that were previously rejected.
+
+EXAMPLE — User asks "Create a simple user auth flow":
+```json
+{
+  "operations": [
+    {
+      "op": "add_shape",
+      "shape": {
+        "id": "shape:login_box", "type": "geo", "x": 100, "y": 300,
+        "rotation": 0, "index": "a1", "parentId": "page:page",
+        "isLocked": false, "opacity": 1, "meta": {},
+        "props": {
+          "geo": "rectangle", "w": 200, "h": 100, "color": "blue", "fill": "solid",
+          "dash": "solid", "size": "m", "font": "sans", "align": "middle", "verticalAlign": "middle",
+          "richText": {"type":"doc","content":[{"type":"paragraph","content":[{"type":"text","text":"Login Page"}]}]},
+          "labelColor": "black", "url": "", "growY": 0, "scale": 1
+        }
+      }
+    },
+    {
+      "op": "add_shape",
+      "shape": {
+        "id": "shape:validate", "type": "geo", "x": 450, "y": 300,
+        "rotation": 0, "index": "a2", "parentId": "page:page",
+        "isLocked": false, "opacity": 1, "meta": {},
+        "props": {
+          "geo": "diamond", "w": 180, "h": 120, "color": "orange", "fill": "solid",
+          "dash": "solid", "size": "m", "font": "sans", "align": "middle", "verticalAlign": "middle",
+          "richText": {"type":"doc","content":[{"type":"paragraph","content":[{"type":"text","text":"Valid Credentials?"}]}]},
+          "labelColor": "black", "url": "", "growY": 0, "scale": 1
+        }
+      }
+    },
+    {
+      "op": "add_shape",
+      "shape": {
+        "id": "shape:dashboard", "type": "geo", "x": 780, "y": 300,
+        "rotation": 0, "index": "a3", "parentId": "page:page",
+        "isLocked": false, "opacity": 1, "meta": {},
+        "props": {
+          "geo": "rectangle", "w": 200, "h": 100, "color": "green", "fill": "solid",
+          "dash": "solid", "size": "m", "font": "sans", "align": "middle", "verticalAlign": "middle",
+          "richText": {"type":"doc","content":[{"type":"paragraph","content":[{"type":"text","text":"Dashboard"}]}]},
+          "labelColor": "black", "url": "", "growY": 0, "scale": 1
+        }
+      }
+    },
+    {
+      "op": "add_shape",
+      "shape": {
+        "id": "shape:arrow1", "type": "arrow", "x": 300, "y": 350,
+        "rotation": 0, "index": "a4", "parentId": "page:page",
+        "isLocked": false, "opacity": 1, "meta": {},
+        "props": {
+          "kind": "arc", "start": {"x": 0, "y": 0}, "end": {"x": 150, "y": 0},
+          "bend": 0, "color": "black", "fill": "none", "dash": "solid", "size": "m",
+          "font": "sans", "arrowheadStart": "none", "arrowheadEnd": "arrow",
+          "labelColor": "black", "labelPosition": 0.5,
+          "richText": {"type":"doc","content":[]}, "scale": 1
+        }
+      }
+    },
+    {
+      "op": "add_shape",
+      "shape": {
+        "id": "shape:arrow2", "type": "arrow", "x": 630, "y": 350,
+        "rotation": 0, "index": "a5", "parentId": "page:page",
+        "isLocked": false, "opacity": 1, "meta": {},
+        "props": {
+          "kind": "arc", "start": {"x": 0, "y": 0}, "end": {"x": 150, "y": 0},
+          "bend": 0, "color": "green", "fill": "none", "dash": "solid", "size": "m",
+          "font": "sans", "arrowheadStart": "none", "arrowheadEnd": "arrow",
+          "labelColor": "black", "labelPosition": 0.5,
+          "richText": {"type":"doc","content":[{"type":"paragraph","content":[{"type":"text","text":"Yes"}]}]},
+          "scale": 1
+        }
+      }
+    }
+  ],
+  "reasoning": "Created a login flow: Login Page → Validate Credentials (diamond decision) → Dashboard, connected with labeled arrows."
+}
+```
 """
 
 
@@ -101,18 +207,42 @@ def _build_context(
                 for c in rt.get("content", []):
                     for t in c.get("content", []):
                         text += t.get("text", "")
-            parts.append(
-                f"  - [{stype}] id={sid} at ({s.get('x', 0):.0f},{s.get('y', 0):.0f})"
-                + (f' text="{text}"' if text else "")
-            )
+            # Build a rich description with dimensions and color
+            desc = f"  - [{stype}] id={sid} at ({s.get('x', 0):.0f},{s.get('y', 0):.0f})"
+            w = props.get("w")
+            h = props.get("h")
+            if w is not None and h is not None:
+                desc += f" size={w}x{h}"
+            elif w is not None:
+                desc += f" w={w}"
+            color = props.get("color")
+            if color:
+                desc += f" color={color}"
+            geo = props.get("geo")
+            if geo and stype == "geo":
+                desc += f" geo={geo}"
+            # Arrow connection info
+            if stype == "arrow":
+                start = props.get("start", {})
+                end = props.get("end", {})
+                desc += f" from=({start.get('x', 0):.0f},{start.get('y', 0):.0f}) to=({end.get('x', 0):.0f},{end.get('y', 0):.0f})"
+            if text:
+                desc += f' text="{text[:80]}"'
+            parts.append(desc)
     else:
         parts.append("CURRENT CANVAS: empty")
 
-    # Rejected history
+    # Rejected history — include both reasoning and what shapes were rejected
     if rejected_ops:
-        parts.append("PREVIOUSLY REJECTED (DO NOT regenerate):")
+        parts.append("PREVIOUSLY REJECTED (DO NOT regenerate these or similar):")
         for rej in rejected_ops[-5:]:
-            parts.append(f"  - {rej.get('reasoning', '?')}")
+            rej_desc = rej.get('reasoning', '?')
+            rej_ops = rej.get('operations', [])
+            if rej_ops and isinstance(rej_ops, list):
+                shape_types = [op.get('shape', {}).get('type', '?') for op in rej_ops if isinstance(op, dict) and op.get('shape')]
+                if shape_types:
+                    rej_desc += f" (shapes: {', '.join(shape_types)})"
+            parts.append(f"  - {rej_desc}")
 
     # Chat history
     if chat_history:
