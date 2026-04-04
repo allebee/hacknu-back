@@ -271,7 +271,7 @@ interface PendingChange {
 
 ```
 pendingChanges: {
-  "chg_A01": { agentId: "agent_0_room1", ... },  // autocomplete agent
+  "chg_A01": { agentId: "agent_0_room1", ... },  // default room agent
   "chg_B01": { agentId: "agent_abc_room1", ... }, // chatbot agent
 }
 
@@ -287,7 +287,7 @@ pendingChanges: {
 |--------|----------|-------------|
 | `POST` | `/complete` | Trigger autocomplete (send `{ room_id }`) |
 | `POST` | `/complete/action` | Approve/reject/edit a pending change |
-| `GET` | `/agents/{room_id}` | List agents in room |
+| `GET` | `/agents/{room_id}` | List agents in room and ensure `agent_0` exists |
 | `POST` | `/agents/{room_id}` | Create new chatbot agent |
 | `POST` | `/agent/{agent_id}/run` | Send chat message to agent |
 | `GET` | `/agent/{agent_id}/messages` | Get chat history timeline |

@@ -62,7 +62,9 @@
 - User can **Approve**, **Reject**, or **Edit** (opens chatbot sidebar)
 
 ### 2. Chatbot Sidebar
-- User creates chatbot agents per room via `POST /agents/{room_id}`
+- Every room has one default chatbot agent, `agent_0_<room_id>`
+- `GET /agents/{room_id}` lazily creates that default agent if it does not exist yet
+- User can create additional chatbot agents per room via `POST /agents/{room_id}`
 - Each chatbot maintains its own conversation history (stored in PostgreSQL)
 - User sends prompts → `POST /agent/{agent_id}/run`
 - Agent can **generate shapes** (written to `pendingChanges`) or **answer questions** about the canvas
@@ -119,7 +121,7 @@ Three tables in PostgreSQL:
 | room_id | VARCHAR(255) | Liveblocks room ID |
 | name | VARCHAR(255) | Display name |
 | type | VARCHAR(50) | `autocomplete` or `chatbot` |
-| is_default | BOOLEAN | True for the autocomplete agent |
+| is_default | BOOLEAN | True for the room's default chatbot agent |
 
 **`agent_changes`** — all agent-generated changes (pending + resolved)
 | Column | Type | Description |
@@ -214,7 +216,7 @@ Multiple chatbot agents can generate suggestions simultaneously. Each `PendingCh
 
 ```
 pendingChanges LiveMap:
-  chg_A01 → { agentId: "agent_0_room1", operations: [...] }    ← autocomplete
+  chg_A01 → { agentId: "agent_0_room1", operations: [...] }    ← default room agent
   chg_B01 → { agentId: "agent_abc_room1", operations: [...] }  ← chatbot
   // Each independently approvable/rejectable
 ```

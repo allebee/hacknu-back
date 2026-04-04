@@ -11,6 +11,7 @@ from typing import Annotated
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy import select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.database import get_db
@@ -49,6 +50,77 @@ agents_router = APIRouter(tags=["agents"])
 agent_router = APIRouter(tags=["agent"])
 transcript_router = APIRouter(tags=["transcript"])
 
+DEFAULT_AGENT_NAME = "Agent 0"
+
+
+def _default_agent_id(room_id: str) -> str:
+    return f"agent_0_{room_id}"
+
+
+async def ensure_default_agent(room_id: str, db: AsyncSession) -> Agent:
+    """Ensure the room has the shared default chatbot agent."""
+    agent_id = _default_agent_id(room_id)
+    agent = await db.get(Agent, agent_id)
+
+    if not agent:
+        db.add(
+            Agent(
+                id=agent_id,
+                room_id=room_id,
+                name=DEFAULT_AGENT_NAME,
+                type="chatbot",
+                is_default=True,
+            )
+        )
+        try:
+            await db.commit()
+        except IntegrityError:
+            await db.rollback()
+        agent = await db.get(Agent, agent_id)
+
+    if not agent:
+        raise HTTPException(status_code=500, detail="Failed to initialize default agent")
+
+    changed = False
+    if agent.name != DEFAULT_AGENT_NAME:
+        agent.name = DEFAULT_AGENT_NAME
+        changed = True
+    if agent.type != "chatbot":
+        agent.type = "chatbot"
+        changed = True
+    if not agent.is_default:
+        agent.is_default = True
+        changed = True
+
+    if changed:
+        await db.commit()
+
+    await db.refresh(agent)
+    return agent
+
+
+async def sync_agent_to_storage(room_id: str, agent: Agent) -> None:
+    """Best-effort mirror of agent registry into Liveblocks storage."""
+    try:
+        await liveblocks.patch_storage(
+            room_id,
+            [
+                {
+                    "op": "add",
+                    "path": f"/agents/{agent.id}",
+                    "value": {
+                        "id": agent.id,
+                        "name": agent.name,
+                        "type": agent.type,
+                        "isDefault": agent.is_default,
+                        "createdAt": agent.created_at.isoformat(),
+                    },
+                }
+            ],
+        )
+    except Exception as e:
+        logger.warning(f"Failed to write agent to storage: {e}")
+
 
 # ───────────────────────────────────────────────────────────────────────
 # POST /complete
@@ -56,21 +128,9 @@ transcript_router = APIRouter(tags=["transcript"])
 
 @complete_router.post("/complete", response_model=CompleteResponse)
 async def autocomplete(req: CompleteRequest, db: DbDep):
-    """Autocomplete endpoint — triggered after idle. Runs with agent_0."""
-    agent_id = f"agent_0_{req.room_id}"
-
-    # Ensure default agent exists
-    existing = await db.get(Agent, agent_id)
-    if not existing:
-        agent = Agent(
-            id=agent_id,
-            room_id=req.room_id,
-            name="Autocomplete Agent",
-            type="autocomplete",
-            is_default=True,
-        )
-        db.add(agent)
-        await db.commit()
+    """Autocomplete endpoint — triggered after idle. Uses the room's default agent."""
+    agent = await ensure_default_agent(req.room_id, db)
+    agent_id = agent.id
 
     # Set presence
     try:
@@ -98,6 +158,7 @@ async def autocomplete(req: CompleteRequest, db: DbDep):
         storage,
         rejected_ops=rejected,
         meeting_context=await get_meeting_context(db, req.room_id),
+        request_mode="autocomplete",
     )
 
     if not operations:
@@ -242,6 +303,7 @@ async def complete_action(req: CompleteActionRequest, db: DbDep):
             storage,
             user_prompt=req.edit_prompt,
             rejected_ops=[{"reasoning": change.reasoning if change else "", "operations": change.operations if change else []}],
+            request_mode="chat_generate",
         )
 
         new_change_id = f"chg_{uuid.uuid4().hex[:12]}"
@@ -284,8 +346,13 @@ async def complete_action(req: CompleteActionRequest, db: DbDep):
 
 @agents_router.get("/agents/{room_id}", response_model=ListAgentsResponse)
 async def list_agents(room_id: str, db: DbDep):
+    default_agent = await ensure_default_agent(room_id, db)
+    await sync_agent_to_storage(room_id, default_agent)
+
     result = await db.execute(
-        select(Agent).where(Agent.room_id == room_id).order_by(Agent.created_at)
+        select(Agent)
+        .where(Agent.room_id == room_id)
+        .order_by(Agent.is_default.desc(), Agent.created_at)
     )
     agents = result.scalars().all()
     return ListAgentsResponse(
@@ -323,22 +390,7 @@ async def create_agent(room_id: str, req: CreateAgentRequest, db: DbDep):
     await db.commit()
 
     # Write to Liveblocks agents LiveMap
-    try:
-        await liveblocks.patch_storage(room_id, [
-            {
-                "op": "add",
-                "path": f"/agents/{agent_id}",
-                "value": {
-                    "id": agent_id,
-                    "name": req.name,
-                    "type": req.type,
-                    "isDefault": False,
-                    "createdAt": now.isoformat(),
-                },
-            }
-        ])
-    except Exception as e:
-        logger.warning(f"Failed to write agent to storage: {e}")
+    await sync_agent_to_storage(room_id, agent)
 
     return CreateAgentResponse(
         agent=AgentInfo(
@@ -423,6 +475,7 @@ async def run_agent(agent_id: str, req: AgentRunRequest, db: DbDep):
         rejected_ops=rejected,
         chat_history=chat_history,
         meeting_context=await get_meeting_context(db, req.room_id),
+        request_mode="chat_generate",
     )
 
     # Save assistant text reply
