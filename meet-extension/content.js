@@ -9,7 +9,7 @@
   "use strict";
 
   const POLL_INTERVAL_MS = 2_000;
-  const BATCH_INTERVAL_MS = 20_000;
+  const BATCH_INTERVAL_MS = 10_000;
   const MIN_TEXT_LENGTH = 5;
 
   // Known Google Meet caption selectors (update if Google changes them)
