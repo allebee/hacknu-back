@@ -4,6 +4,7 @@ API route handlers.
 
 from __future__ import annotations
 
+from copy import deepcopy
 import uuid
 import logging
 from datetime import datetime, timezone
@@ -36,6 +37,7 @@ from app.schemas import (
     TranscriptDeleteResponse,
 )
 from app.liveblocks import liveblocks
+from app.operations import sanitize_operations_for_apply
 from app.planner import generate_operations, generate_query_answer
 from app.transcript import store_chunks, get_meeting_context, get_transcript_entries, clear_transcript
 
@@ -55,6 +57,92 @@ DEFAULT_AGENT_NAME = "Agent 0"
 
 def _default_agent_id(room_id: str) -> str:
     return f"agent_0_{room_id}"
+
+
+def _new_change_identity() -> tuple[uuid.UUID, str]:
+    change_uuid = uuid.uuid4()
+    return change_uuid, str(change_uuid)
+
+
+def _get_pending_change_entry(storage: dict, change_id: str) -> dict | None:
+    pending_changes = storage.get("pendingChanges")
+    if isinstance(pending_changes, dict):
+        entry = pending_changes.get(change_id)
+        if isinstance(entry, dict):
+            return entry
+    return None
+
+
+def _normalize_operations(operations: object) -> list[dict]:
+    if isinstance(operations, list):
+        return [op for op in operations if isinstance(op, dict)]
+    return []
+
+
+def _match_pending_db_change(
+    pending_rows: list[AgentChange],
+    public_change_id: str,
+    pending_entry: dict | None,
+) -> AgentChange | None:
+    try:
+        requested_uuid = uuid.UUID(public_change_id)
+    except ValueError:
+        requested_uuid = None
+
+    for row in pending_rows:
+        if requested_uuid and row.id == requested_uuid:
+            return row
+        if public_change_id == str(row.id):
+            return row
+
+    if not pending_entry:
+        return None
+
+    target_agent_id = pending_entry.get("agentId")
+    target_reasoning = pending_entry.get("reasoning")
+    target_operations = _normalize_operations(pending_entry.get("operations"))
+
+    for row in pending_rows:
+        if target_agent_id and row.agent_id != target_agent_id:
+            continue
+        if target_reasoning is not None and row.reasoning != target_reasoning:
+            continue
+        if target_operations and _normalize_operations(row.operations) == target_operations:
+            return row
+
+    for row in pending_rows:
+        if target_agent_id and row.agent_id != target_agent_id:
+            continue
+        if target_reasoning and row.reasoning == target_reasoning:
+            return row
+
+    return None
+
+
+def _deep_merge_dict(base: dict, updates: dict) -> dict:
+    merged = deepcopy(base)
+    for key, value in updates.items():
+        if isinstance(value, dict) and isinstance(merged.get(key), dict):
+            merged[key] = _deep_merge_dict(merged[key], value)
+        else:
+            merged[key] = value
+    return merged
+
+
+def _build_edit_user_prompt(edit_prompt: str, previous_reasoning: str = "") -> str:
+    feedback = edit_prompt.strip()
+    if not previous_reasoning:
+        return feedback
+
+    return "\n".join(
+        [
+            "Revise the previous pending canvas suggestion.",
+            f"Previous suggestion: {previous_reasoning}",
+            f"User edit request: {feedback}",
+            "Prefer updating the existing suggested relationship instead of asking for confirmation when a sensible interpretation exists.",
+            "If multiple shapes match by label, choose the most sensible one based on the current canvas.",
+        ]
+    )
 
 
 async def ensure_default_agent(room_id: str, db: AsyncSession) -> Agent:
@@ -166,9 +254,9 @@ async def autocomplete(req: CompleteRequest, db: DbDep):
         return CompleteResponse(change_id="", operations_count=0, reasoning=reasoning or "No suggestions")
 
     # Save to DB
-    change_id = f"chg_{uuid.uuid4().hex[:12]}"
+    change_uuid, change_id = _new_change_identity()
     change = AgentChange(
-        id=uuid.uuid4(),
+        id=change_uuid,
         room_id=req.room_id,
         agent_id=agent_id,
         status="pending",
@@ -216,25 +304,47 @@ async def autocomplete(req: CompleteRequest, db: DbDep):
 async def complete_action(req: CompleteActionRequest, db: DbDep):
     """Approve, reject, or edit a pending change."""
 
+    try:
+        storage = await liveblocks.get_storage(req.room_id)
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"Failed to read storage: {e}")
+
+    pending_entry = _get_pending_change_entry(storage, req.change_id)
+
     # Find the change in DB
     result = await db.execute(
         select(AgentChange).where(
             AgentChange.room_id == req.room_id,
             AgentChange.status == "pending",
-        )
+        ).order_by(AgentChange.created_at.desc())
     )
-    change = None
-    for c in result.scalars():
-        if req.change_id in str(c.id) or req.change_id == str(c.id):
-            change = c
-            break
+    pending_rows = list(result.scalars())
+    change = _match_pending_db_change(pending_rows, req.change_id, pending_entry)
+
+    if not pending_entry and not change:
+        raise HTTPException(status_code=404, detail=f"Pending change not found: {req.change_id}")
+
+    source_operations = _normalize_operations(
+        pending_entry.get("operations") if pending_entry else (change.operations if change else [])
+    )
+    source_reasoning = (
+        (pending_entry.get("reasoning") or "") if pending_entry
+        else (change.reasoning or "")
+    )
+    source_agent_id = (
+        str(pending_entry.get("agentId")) if pending_entry and pending_entry.get("agentId")
+        else (change.agent_id if change else _default_agent_id(req.room_id))
+    )
 
     if req.action == "approve":
         # Move shapes from operations to /shapes
-        if change:
+        if pending_entry or change:
+            shapes = storage.get("shapes", {})
+            source_operations = sanitize_operations_for_apply(storage, source_operations)
             ops_patch = []
-            for op_data in change.operations:
-                if isinstance(op_data, dict) and op_data.get("op") == "add_shape":
+            for op_data in source_operations:
+                op_name = op_data.get("op")
+                if op_name == "add_shape":
                     shape = op_data.get("shape", {})
                     shape_id = shape.get("id", f"shape:{uuid.uuid4().hex[:8]}")
                     ops_patch.append({
@@ -242,13 +352,31 @@ async def complete_action(req: CompleteActionRequest, db: DbDep):
                         "path": f"/shapes/{shape_id}",
                         "value": shape,
                     })
-                elif isinstance(op_data, dict) and op_data.get("op") == "delete_shape":
+                elif op_name == "delete_shape":
                     sid = op_data.get("shapeId", "")
                     if sid:
                         ops_patch.append({"op": "remove", "path": f"/shapes/{sid}"})
+                elif op_name == "update_shape":
+                    sid = op_data.get("shapeId", "")
+                    updates = op_data.get("updates")
+                    current_shape = shapes.get(sid) if isinstance(shapes, dict) else None
+                    if not sid or not isinstance(updates, dict) or not isinstance(current_shape, dict):
+                        raise HTTPException(
+                            status_code=409,
+                            detail=f"Cannot apply update_shape for {sid or 'unknown shape'}",
+                        )
+                    ops_patch.append({
+                        "op": "add",
+                        "path": f"/shapes/{sid}",
+                        "value": _deep_merge_dict(current_shape, updates),
+                    })
 
-            # Remove from pendingChanges
-            ops_patch.append({"op": "remove", "path": f"/pendingChanges/{req.change_id}"})
+            if pending_entry:
+                # Remove from pendingChanges
+                ops_patch.append({"op": "remove", "path": f"/pendingChanges/{req.change_id}"})
+
+            if not ops_patch:
+                raise HTTPException(status_code=409, detail="Pending change has no applicable operations")
 
             try:
                 await liveblocks.patch_storage(req.room_id, ops_patch)
@@ -256,20 +384,22 @@ async def complete_action(req: CompleteActionRequest, db: DbDep):
                 logger.error(f"Approve patch failed: {e}")
                 raise HTTPException(status_code=502, detail=str(e))
 
-            change.status = "approved"
-            change.resolved_at = datetime.now(timezone.utc)
-            await db.commit()
+            if change:
+                change.status = "approved"
+                change.resolved_at = datetime.now(timezone.utc)
+                await db.commit()
 
         return CompleteActionResponse(status="approved")
 
     elif req.action == "reject":
         # Remove from Liveblocks
-        try:
-            await liveblocks.patch_storage(req.room_id, [
-                {"op": "remove", "path": f"/pendingChanges/{req.change_id}"}
-            ])
-        except Exception as e:
-            logger.warning(f"Reject patch failed: {e}")
+        if pending_entry:
+            try:
+                await liveblocks.patch_storage(req.room_id, [
+                    {"op": "remove", "path": f"/pendingChanges/{req.change_id}"}
+                ])
+            except Exception as e:
+                logger.warning(f"Reject patch failed: {e}")
 
         if change:
             change.status = "rejected"
@@ -284,12 +414,17 @@ async def complete_action(req: CompleteActionRequest, db: DbDep):
             raise HTTPException(status_code=400, detail="edit_prompt required for edit action")
 
         # Remove old pending
-        try:
-            await liveblocks.patch_storage(req.room_id, [
-                {"op": "remove", "path": f"/pendingChanges/{req.change_id}"}
-            ])
-        except Exception:
-            pass
+        if pending_entry:
+            try:
+                await liveblocks.patch_storage(req.room_id, [
+                    {"op": "remove", "path": f"/pendingChanges/{req.change_id}"}
+                ])
+            except Exception as e:
+                logger.warning(f"Edit patch remove failed: {e}")
+
+            pending_changes = storage.get("pendingChanges")
+            if isinstance(pending_changes, dict):
+                pending_changes.pop(req.change_id, None)
 
         if change:
             change.status = "rejected"
@@ -298,44 +433,57 @@ async def complete_action(req: CompleteActionRequest, db: DbDep):
             await db.commit()
 
         # Re-run with edit context
-        storage = await liveblocks.get_storage(req.room_id)
+        edit_user_prompt = _build_edit_user_prompt(req.edit_prompt, source_reasoning)
         operations, reasoning = await generate_operations(
             storage,
-            user_prompt=req.edit_prompt,
-            rejected_ops=[{"reasoning": change.reasoning if change else "", "operations": change.operations if change else []}],
+            user_prompt=edit_user_prompt,
+            rejected_ops=[{"reasoning": source_reasoning, "operations": source_operations}] if source_operations or source_reasoning else None,
+            meeting_context=await get_meeting_context(db, req.room_id),
             request_mode="chat_generate",
+            include_full_storage=True,
         )
 
-        new_change_id = f"chg_{uuid.uuid4().hex[:12]}"
-        if operations:
-            new_change = AgentChange(
-                id=uuid.uuid4(),
-                room_id=req.room_id,
-                agent_id=change.agent_id if change else f"agent_0_{req.room_id}",
-                status="pending",
-                operations=operations,
-                reasoning=reasoning,
+        if not operations:
+            return CompleteActionResponse(
+                status="no_change",
+                reasoning=reasoning or "No canvas update was generated.",
+                operations_count=0,
             )
-            db.add(new_change)
-            await db.commit()
 
-            now = datetime.now(timezone.utc).isoformat()
-            await liveblocks.patch_storage(req.room_id, [
-                {
-                    "op": "add",
-                    "path": f"/pendingChanges/{new_change_id}",
-                    "value": {
-                        "id": new_change_id,
-                        "agentId": change.agent_id if change else f"agent_0_{req.room_id}",
-                        "status": "pending",
-                        "operations": operations,
-                        "reasoning": reasoning,
-                        "createdAt": now,
-                    },
-                }
-            ])
+        new_change_uuid, new_change_id = _new_change_identity()
+        new_change = AgentChange(
+            id=new_change_uuid,
+            room_id=req.room_id,
+            agent_id=source_agent_id,
+            status="pending",
+            operations=operations,
+            reasoning=reasoning,
+        )
+        db.add(new_change)
+        await db.commit()
 
-        return CompleteActionResponse(status="edited", new_change_id=new_change_id)
+        now = datetime.now(timezone.utc).isoformat()
+        await liveblocks.patch_storage(req.room_id, [
+            {
+                "op": "add",
+                "path": f"/pendingChanges/{new_change_id}",
+                "value": {
+                    "id": new_change_id,
+                    "agentId": source_agent_id,
+                    "status": "pending",
+                    "operations": operations,
+                    "reasoning": reasoning,
+                    "createdAt": now,
+                },
+            }
+        ])
+
+        return CompleteActionResponse(
+            status="edited",
+            new_change_id=new_change_id,
+            reasoning=reasoning,
+            operations_count=len(operations),
+        )
 
     raise HTTPException(status_code=400, detail=f"Unknown action: {req.action}")
 
@@ -511,9 +659,9 @@ async def run_agent(agent_id: str, req: AgentRunRequest, db: DbDep):
         )
 
     # Save change to DB
-    change_id = f"chg_{uuid.uuid4().hex[:12]}"
+    change_uuid, change_id = _new_change_identity()
     db_change = AgentChange(
-        id=uuid.uuid4(),
+        id=change_uuid,
         room_id=req.room_id,
         agent_id=agent_id,
         status="pending",

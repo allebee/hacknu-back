@@ -148,6 +148,19 @@ interface ArrowShapeProps {
 ```
 
 > **Note on bindings:** Arrow-to-shape connections (bindings) are handled by the frontend via `editor.createBindings()`. The storage only stores `start`/`end` coordinates — the frontend snaps arrows to shapes.
+>
+> Agent-generated arrows may also include:
+> ```typescript
+> meta: {
+>   agentConnection?: {
+>     startShapeId: string
+>     endShapeId: string
+>     startAnchor?: { x: number; y: number } // normalized 0..1
+>     endAnchor?: { x: number; y: number }   // normalized 0..1
+>   }
+> }
+> ```
+> The backend uses this metadata to compute a visually correct arrow. The frontend should use it to create actual tldraw bindings when the change is approved.
 
 ### `note` — Sticky Note
 
@@ -244,7 +257,7 @@ The backend writes agent-generated suggestions to `pendingChanges`. The frontend
 
 ```typescript
 interface PendingChange {
-  id: string;            // "chg_xxxx"
+  id: string;            // UUID string, same as agent_changes.id
   agentId: string;       // which agent created this
   status: "pending";
   operations: Array<{
@@ -271,12 +284,12 @@ interface PendingChange {
 
 ```
 pendingChanges: {
-  "chg_A01": { agentId: "agent_0_room1", ... },  // default room agent
-  "chg_B01": { agentId: "agent_abc_room1", ... }, // chatbot agent
+  "0d6d8557-4778-40fd-bfd0-8cb89b1685d9": { agentId: "agent_0_room1", ... },  // default room agent
+  "de37619c-d4b8-45fd-97e9-4de3dbf8b7fc": { agentId: "agent_abc_room1", ... }, // chatbot agent
 }
 
 // Each agent's changes have independent approve/reject
-// Approving chg_A01 does NOT affect chg_B01
+// Approving one UUID-keyed change does NOT affect another
 ```
 
 ---

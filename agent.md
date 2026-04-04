@@ -216,8 +216,8 @@ Multiple chatbot agents can generate suggestions simultaneously. Each `PendingCh
 
 ```
 pendingChanges LiveMap:
-  chg_A01 → { agentId: "agent_0_room1", operations: [...] }    ← default room agent
-  chg_B01 → { agentId: "agent_abc_room1", operations: [...] }  ← chatbot
+  0d6d8557-4778-40fd-bfd0-8cb89b1685d9 → { agentId: "agent_0_room1", operations: [...] }    ← default room agent
+  de37619c-d4b8-45fd-97e9-4de3dbf8b7fc → { agentId: "agent_abc_room1", operations: [...] }  ← chatbot
   // Each independently approvable/rejectable
 ```
 

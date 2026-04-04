@@ -54,6 +54,8 @@ class CompleteActionRequest(BaseModel):
 class CompleteActionResponse(BaseModel):
     status: str = "ok"
     new_change_id: str | None = None
+    reasoning: str | None = None
+    operations_count: int = 0
 
 
 # ── GET/POST /agents/{room_id} ─────────────────────────────────────────

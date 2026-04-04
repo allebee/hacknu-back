@@ -47,7 +47,7 @@ class LiveblocksClient:
                 # Try to create missing parent keys and retry
                 body = r.json()
                 msg = body.get("message", "")
-                # e.g. "Add failed: Path pendingChanges/chg_xxx does not exist"
+                # e.g. "Add failed: Path pendingChanges/<change-uuid> does not exist"
                 if "does not exist" in msg:
                     missing_parents = set()
                     for op in operations:

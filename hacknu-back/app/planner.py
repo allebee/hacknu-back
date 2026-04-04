@@ -2,7 +2,7 @@
 LLM planner — generates structured canvas operations.
 
 Reads current storage state, rejected history, builds LLM prompt,
-returns validated shape operations.
+returns normalized shape operations.
 """
 
 from __future__ import annotations
@@ -12,6 +12,7 @@ import logging
 from openai import AsyncOpenAI
 
 from app.config import AGENT_PROVIDER, AGENT_MODEL, OPENAI_API_KEY, GEMINI_API_KEY
+from app.operations import AGENT_CONNECTION_META_KEY, normalize_generated_operations
 
 logger = logging.getLogger(__name__)
 
@@ -114,8 +115,11 @@ SPATIAL LAYOUT RULES:
 - Default geo size: w=200, h=100. Notes are ~200x200. Text: w=200.
 - Leave at least 40px gap between shapes to avoid overlap.
 - When adding shapes near existing ones, check their positions AND sizes from the context.
-- For arrows connecting two shapes: set start to the center of the source shape, end to the center of the target shape.
-  Example: source at (100,200) size 200x100 → arrow start = {x:200, y:250}. Target at (500,200) size 200x100 → arrow end = {x:500, y:250}.
+- Arrow `shape.x` / `shape.y` are the arrow origin in page space. Arrow `props.start` / `props.end` are local coordinates relative to that origin.
+- When an arrow should connect two shapes, set `meta.agentConnection = { "startShapeId": "...", "endShapeId": "...", "startAnchor": {"x":0.5,"y":0.5}, "endAnchor": {"x":0.5,"y":0.5} }`.
+- Use exact shape IDs from the canvas context for `startShapeId` / `endShapeId`, including IDs of shapes you create earlier in the same response.
+- The backend computes final arrow geometry from `meta.agentConnection`, so prefer correct IDs over guessing final arrow coordinates.
+- For `update_shape` on arrows, NEVER put `start` or `end` at the top level of `updates`; they belong inside `updates.props`.
 - Arrange related shapes in logical flows: left-to-right, top-to-bottom, or radial.
 - Use frames to group related concepts when generating 5+ shapes.
 
@@ -254,7 +258,15 @@ EXAMPLE — User asks "Create a simple user auth flow":
       "shape": {
         "id": "shape:arrow1", "type": "arrow", "x": 300, "y": 350,
         "rotation": 0, "index": "a4", "parentId": "page:page",
-        "isLocked": false, "opacity": 1, "meta": {},
+        "isLocked": false, "opacity": 1,
+        "meta": {
+          "agentConnection": {
+            "startShapeId": "shape:login_box",
+            "endShapeId": "shape:validate",
+            "startAnchor": {"x": 0.5, "y": 0.5},
+            "endAnchor": {"x": 0.5, "y": 0.5}
+          }
+        },
         "props": {
           "kind": "arc", "start": {"x": 0, "y": 0}, "end": {"x": 150, "y": 0},
           "bend": 0, "color": "black", "fill": "none", "dash": "solid", "size": "m",
@@ -269,7 +281,15 @@ EXAMPLE — User asks "Create a simple user auth flow":
       "shape": {
         "id": "shape:arrow2", "type": "arrow", "x": 630, "y": 350,
         "rotation": 0, "index": "a5", "parentId": "page:page",
-        "isLocked": false, "opacity": 1, "meta": {},
+        "isLocked": false, "opacity": 1,
+        "meta": {
+          "agentConnection": {
+            "startShapeId": "shape:validate",
+            "endShapeId": "shape:dashboard",
+            "startAnchor": {"x": 0.5, "y": 0.5},
+            "endAnchor": {"x": 0.5, "y": 0.5}
+          }
+        },
         "props": {
           "kind": "arc", "start": {"x": 0, "y": 0}, "end": {"x": 150, "y": 0},
           "bend": 0, "color": "green", "fill": "none", "dash": "solid", "size": "m",
@@ -358,6 +378,14 @@ def _build_context(
                 start = props.get("start", {})
                 end = props.get("end", {})
                 desc += f" from=({start.get('x', 0):.0f},{start.get('y', 0):.0f}) to=({end.get('x', 0):.0f},{end.get('y', 0):.0f})"
+                meta = s.get("meta", {})
+                if isinstance(meta, dict):
+                    connection = meta.get(AGENT_CONNECTION_META_KEY)
+                    if isinstance(connection, dict):
+                        start_shape_id = connection.get("startShapeId")
+                        end_shape_id = connection.get("endShapeId")
+                        if start_shape_id and end_shape_id:
+                            desc += f" links={start_shape_id}->{end_shape_id}"
             if text:
                 desc += f' text="{text[:80]}"'
             parts.append(desc)
@@ -450,12 +478,15 @@ async def generate_operations(
 
     try:
         parsed = json.loads(raw)
-        operations = parsed.get("operations", [])
+        operations = normalize_generated_operations(storage, parsed.get("operations", []))
         reasoning = parsed.get("reasoning", "")
         return operations, reasoning
     except json.JSONDecodeError as e:
         logger.error(f"[Planner] JSON parse failed: {e}")
         return [], "Failed to parse LLM response"
+    except Exception as e:
+        logger.error(f"[Planner] Operation normalization failed: {e}")
+        return [], "Failed to normalize generated canvas operations"
 
 
 async def generate_query_answer(
