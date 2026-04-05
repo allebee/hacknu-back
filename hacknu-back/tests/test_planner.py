@@ -28,6 +28,8 @@ class PlannerModePromptTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("align it by exact `x` or exact `y`", system_prompt)
         self.assertIn("Never place a new shape diagonally", system_prompt)
         self.assertIn("anchor the new shape or change to the newest relevant shape", system_prompt)
+        self.assertIn("default to the relevant shape with the largest `eventTs`", system_prompt)
+        self.assertIn("recency takes priority over insertion order", system_prompt)
         self.assertIn("do not create a duplicate arrow between the same two shape IDs", system_prompt)
         self.assertIn("existing arrow between the same two shapes in either direction", system_prompt)
         self.assertIn("Allow at most one arrow between any two shape IDs", system_prompt)
@@ -377,6 +379,11 @@ class PlannerModePromptTests(unittest.IsolatedAsyncioTestCase):
         summary_latest = '[note] id=shape:latest at (340,100) eventTs=2026-04-05T11:00:00Z text="Latest sticker"'
         summary_middle = '[note] id=shape:middle at (220,100) eventTs=2026-04-05T10:00:00Z text="Middle sticker"'
         summary_first = '[note] id=shape:first at (100,100) eventTs=2026-04-05T09:00:00Z text="First sticker"'
+        self.assertIn(
+            "RECENCY PRIORITY: when several shapes could match, prefer the newest relevant shape by eventTs.",
+            context,
+        )
+        self.assertIn("NEWEST TIMESTAMPED SHAPES FIRST:", context)
         self.assertLess(context.index(summary_middle), context.index(summary_first))
         self.assertLess(context.index(summary_latest), context.index(summary_middle))
         self.assertIn('"shape:latest":{"id":"shape:latest","type":"note","x":340,"y":100,"eventTs":"2026-04-05T11:00:00Z","text":"Latest sticker"}', context)

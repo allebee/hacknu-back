@@ -92,6 +92,9 @@ Rules:
 - To reference new shapes in the same response, put `"ref": "name"` on the `add_shape` and use `"ref:name"` in later operations.
 - Use exact existing shape IDs from the canvas context when referring to current shapes.
 - When a shape includes `eventTs`, treat larger / newer timestamps as more recent edits or additions.
+- If several existing shapes could plausibly match the request, default to the relevant shape with the largest `eventTs`.
+- Only update, extend, or anchor to an older matching shape when the user explicitly identifies that older item by its text, position, or another clear attribute.
+- When the request is ambiguous among similar shapes, `eventTs` recency takes priority over insertion order, canvas proximity, or left-to-right reading order.
 - When extending a sequence, cluster, or connected chain, anchor the new shape or change to the newest relevant shape by `eventTs`, not the oldest one.
 - If several connected stickers or notes form a row or flow, place the next one adjacent to the latest sticker or note in that chain.
 - `x` / `y` are optional high-level layout hints, not precise geometry requirements.
@@ -387,6 +390,22 @@ def _sorted_shapes_for_llm(shapes: object) -> list[tuple[str, dict]]:
     )
 
 
+def _recent_shapes_hint_for_llm(sorted_shapes: list[tuple[str, dict]]) -> list[str]:
+    recent_shapes: list[str] = []
+
+    for shape_id, shape in sorted_shapes:
+        _, event_ts = _shape_event_ts(shape)
+        if event_ts is None:
+            continue
+        desc = _describe_shape_for_llm(shape_id, shape)
+        if desc:
+            recent_shapes.append(desc)
+        if len(recent_shapes) >= 8:
+            break
+
+    return recent_shapes
+
+
 def _compact_shape_for_llm(shape_id: str, shape: dict) -> dict | None:
     shape_type = shape.get("type", "?")
     if shape_type in {"draw", "group"}:
@@ -612,6 +631,7 @@ def _build_context(
 ) -> str:
     """Build a compact context string from storage + history + meeting."""
     parts = [f"REQUEST MODE: {request_mode}"]
+    sorted_shapes = _sorted_shapes_for_llm(storage.get("shapes"))
 
     if user_prompt:
         parts.append(f"USER REQUEST: {user_prompt}")
@@ -624,9 +644,17 @@ def _build_context(
     if meeting_context:
         parts.append(meeting_context)
 
+    recent_shapes = _recent_shapes_hint_for_llm(sorted_shapes)
+    if recent_shapes:
+        parts.append(
+            "RECENCY PRIORITY: when several shapes could match, prefer the newest relevant shape by eventTs."
+        )
+        parts.append("NEWEST TIMESTAMPED SHAPES FIRST:")
+        parts.extend(recent_shapes)
+
     # Current shapes on canvas
     visible_shapes: list[str] = []
-    for sid, s in _sorted_shapes_for_llm(storage.get("shapes"))[:30]:
+    for sid, s in sorted_shapes[:30]:
         desc = _describe_shape_for_llm(sid, s)
         if desc:
             visible_shapes.append(desc)
