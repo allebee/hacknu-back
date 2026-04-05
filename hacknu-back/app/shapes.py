@@ -13,6 +13,9 @@ from typing import Annotated, Literal, Union
 
 from pydantic import BaseModel, Field
 
+DEFAULT_GEO_WIDTH = 260
+DEFAULT_GEO_HEIGHT = 140
+
 
 # ── Style Enums (from tldraw TLDefaultXStyle) ──────────────────────────
 
@@ -74,8 +77,8 @@ class TLBaseShape(BaseModel):
 
 class GeoShapeProps(BaseModel):
     geo: TLGeoType = "rectangle"
-    w: float = 200
-    h: float = 100
+    w: float = DEFAULT_GEO_WIDTH
+    h: float = DEFAULT_GEO_HEIGHT
     color: TLColor = "black"
     fill: TLFill = "solid"
     dash: TLDash = "solid"

@@ -39,6 +39,8 @@ class AgentChange(Base):
     operations: Mapped[dict] = mapped_column(JSONB, nullable=False)
     reasoning: Mapped[str | None] = mapped_column(Text, nullable=True)
     user_feedback: Mapped[str | None] = mapped_column(Text, nullable=True)
+    x: Mapped[float | None] = mapped_column(Float, nullable=True)
+    y: Mapped[float | None] = mapped_column(Float, nullable=True)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=lambda: datetime.now(timezone.utc)
     )

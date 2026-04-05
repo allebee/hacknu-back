@@ -6,7 +6,7 @@ from __future__ import annotations
 
 from typing import Literal, Union
 
-from pydantic import BaseModel, Field
+from pydantic import AliasChoices, BaseModel, Field
 
 from app.shapes import CanvasShape
 
@@ -27,17 +27,30 @@ class PendingChange(BaseModel):
     status: Literal["pending"] = "pending"
     operations: list[ShapeOperation]
     reasoning: str = ""
+    x: float | None = None
+    y: float | None = None
     createdAt: str
+
+
+class Viewport(BaseModel):
+    x: float | None = None
+    y: float | None = None
+    width: float = Field(gt=0, validation_alias=AliasChoices("width", "w"))
+    height: float = Field(gt=0, validation_alias=AliasChoices("height", "h"))
+    zoom: float | None = Field(default=None, gt=0)
 
 
 # ── POST /complete ─────────────────────────────────────────────────────
 
 class CompleteRequest(BaseModel):
     room_id: str
+    viewport: Viewport | None = None
 
 
 class CompleteResponse(BaseModel):
     change_id: str
+    x: float | None = None
+    y: float | None = None
     operations_count: int
     reasoning: str
 
@@ -49,13 +62,26 @@ class CompleteActionRequest(BaseModel):
     change_id: str
     action: Literal["approve", "reject", "edit"]
     edit_prompt: str | None = None
+    viewport: Viewport | None = None
 
 
 class CompleteActionResponse(BaseModel):
     status: str = "ok"
     new_change_id: str | None = None
+    x: float | None = None
+    y: float | None = None
     reasoning: str | None = None
     operations_count: int = 0
+
+
+# ── POST /agent/{agent_id}/action ──────────────────────────────────────
+
+class AgentActionRequest(BaseModel):
+    room_id: str | None = None
+    change_id: str
+    action: Literal["approve", "reject", "edit"]
+    edit_prompt: str | None = None
+    viewport: Viewport | None = None
 
 
 # ── GET/POST /agents/{room_id} ─────────────────────────────────────────
@@ -87,10 +113,13 @@ class AgentRunRequest(BaseModel):
     room_id: str
     prompt: str
     mode: Literal["generate", "query"] = "generate"
+    viewport: Viewport | None = None
 
 
 class AgentRunResponse(BaseModel):
     change_id: str | None = None
+    x: float | None = None
+    y: float | None = None
     operations_count: int | None = None
     reasoning: str | None = None
     answer: str | None = None
@@ -111,6 +140,8 @@ class ChangeEntry(BaseModel):
     id: str
     type: Literal["change"] = "change"
     change_id: str
+    x: float | None = None
+    y: float | None = None
     change_status: Literal["pending", "approved", "rejected"]
     operations_summary: str
     created_at: str

@@ -9,6 +9,21 @@ from typing import Any
 
 from app.config import AI_DEBUG_PRINTS
 
+_LLM_DEBUG_PREFIXES = (
+    "planner.generate_operations.",
+    "planner.generate_query_answer.",
+    "transcript.summarize.",
+)
+_LLM_DEBUG_SUFFIXES = (
+    ".system_prompt",
+    ".user_context",
+    ".user_input",
+    ".llm_payload",
+    ".llm_response",
+    ".llm_raw_content",
+    ".llm_error",
+)
+
 
 def _debug_default(value: Any) -> Any:
     if hasattr(value, "model_dump") and callable(value.model_dump):
@@ -29,8 +44,15 @@ def _debug_default(value: Any) -> Any:
     return repr(value)
 
 
+def _should_print_label(label: str) -> bool:
+    return (
+        label.startswith(_LLM_DEBUG_PREFIXES)
+        and label.endswith(_LLM_DEBUG_SUFFIXES)
+    )
+
+
 def debug_print(label: str, payload: Any) -> None:
-    if not AI_DEBUG_PRINTS:
+    if not AI_DEBUG_PRINTS or not _should_print_label(label):
         return
 
     print(f"\n[AI DEBUG] {label}", flush=True)

@@ -86,8 +86,8 @@ type TLGeoType = "rectangle" | "ellipse" | "triangle" | "diamond" | "pentagon"
 
 interface GeoShapeProps {
   geo: TLGeoType;              // default: "rectangle"
-  w: number;                   // width, default: 200
-  h: number;                   // height, default: 100
+  w: number;                   // width, default: 260
+  h: number;                   // height, default: 140
   color: TLColor;              // default: "black"
   fill: TLFill;                // default: "solid"
   dash: TLDash;                // default: "solid"
@@ -103,6 +103,8 @@ interface GeoShapeProps {
 }
 ```
 
+> Agent-generated geo shapes are style-locked by the backend. The LLM should only vary semantic fields such as `geo`, text, position, and when necessary `w` / `h`.
+
 **Example:**
 ```json
 {
@@ -110,7 +112,7 @@ interface GeoShapeProps {
   "x": 100, "y": 200, "rotation": 0, "index": "a1",
   "parentId": "page:page", "isLocked": false, "opacity": 1,
   "props": {
-    "geo": "rectangle", "w": 200, "h": 100,
+    "geo": "rectangle", "w": 260, "h": 140,
     "color": "blue", "fill": "solid", "dash": "solid",
     "size": "m", "font": "draw", "align": "middle", "verticalAlign": "middle",
     "richText": {"type":"doc","content":[{"type":"paragraph","content":[{"type":"text","text":"Hello"}]}]},
@@ -147,6 +149,8 @@ interface ArrowShapeProps {
 }
 ```
 
+> Agent-generated arrows are style-locked by the backend. The LLM should mainly vary `startShapeId`, `endShapeId`, and optional label text.
+
 > **Note on bindings:** Arrow-to-shape connections (bindings) are handled by the frontend via `editor.createBindings()`. The storage only stores `start`/`end` coordinates — the frontend snaps arrows to shapes.
 >
 > Agent-generated arrows may also include:
@@ -180,6 +184,8 @@ interface NoteShapeProps {
 }
 ```
 
+> Agent-generated notes are style-locked by the backend: pending suggestions use `color: "blue"`, approved notes use `color: "yellow"`, and note size/alignment/font are fixed defaults rather than prompt-controlled fields.
+
 ### `text` — Free Text
 
 ```typescript
@@ -195,6 +201,8 @@ interface TextShapeProps {
 }
 ```
 
+> Agent-generated text is style-locked by the backend: font, color, alignment, and width defaults are fixed. The prompt-facing payload should only vary the text content and position.
+
 ### `frame` — Container
 
 ```typescript
@@ -205,6 +213,8 @@ interface FrameShapeProps {
   color: TLColor;     // default: "black"
 }
 ```
+
+> Agent-generated frames keep backend defaults for styling; only `name`, `x`, `y`, `w`, and `h` are intended to vary from the LLM side.
 
 ### `line` — Multi-point Line/Spline
 
@@ -260,6 +270,8 @@ interface PendingChange {
   id: string;            // UUID string, same as agent_changes.id
   agentId: string;       // which agent created this
   status: "pending";
+  x?: number;            // top-left target X for the overall change
+  y?: number;            // top-left target Y for the overall change
   operations: Array<{
     op: "add_shape" | "update_shape" | "delete_shape";
     shape?: CanvasShape;   // full shape for add_shape
@@ -276,9 +288,9 @@ interface PendingChange {
 1. **Subscribe** to `pendingChanges` via `useStorage`
 2. **Filter by `agentId`** to show per-agent approve/reject buttons
 3. **Render `add_shape` operations** as semi-transparent ghost shapes
-4. On **Approve** → call `POST /complete/action` with `action: "approve"`
-5. On **Reject** → call `POST /complete/action` with `action: "reject"`
-6. On **Edit** → open chatbot sidebar, call `POST /complete/action` with `action: "edit"` and `edit_prompt`
+4. For `/complete` suggestions, call `POST /complete/action`
+5. For `/agent/{agent_id}/run` suggestions, call `POST /agent/{agent_id}/action`
+6. Send `action: "approve" | "reject" | "edit"` and the current `viewport`; include `edit_prompt` for edit flows
 
 ### Multiple agents at once:
 
@@ -294,15 +306,52 @@ pendingChanges: {
 
 ---
 
+## Viewport Payload For AI Endpoints
+
+Send the current visible canvas bounds on every call to `/complete`, `/complete/action`, `/agent/{agent_id}/run`, and `/agent/{agent_id}/action`.
+
+```typescript
+type AgentViewport = {
+  x?: number;       // visible top-left canvas x
+  y?: number;       // visible top-left canvas y
+  width: number;    // visible viewport width in canvas coordinates
+  height: number;   // visible viewport height in canvas coordinates
+  zoom?: number;    // current camera zoom
+}
+```
+
+The backend also accepts `w` / `h` as aliases for `width` / `height`, but `width` / `height` is the canonical payload.
+
+Recommended request shapes:
+
+```json
+POST /complete
+{ "room_id": "room-1", "viewport": { "x": 0, "y": 0, "width": 1280, "height": 720, "zoom": 1 } }
+
+POST /complete/action
+{ "room_id": "room-1", "change_id": "...", "action": "edit", "edit_prompt": "move this below the title", "viewport": { "x": 0, "y": 0, "width": 1280, "height": 720, "zoom": 1 } }
+
+POST /agent/{agent_id}/run
+{ "room_id": "room-1", "prompt": "add next steps", "mode": "generate", "viewport": { "x": 0, "y": 0, "width": 1280, "height": 720, "zoom": 1 } }
+
+POST /agent/{agent_id}/action
+{ "change_id": "...", "action": "edit", "edit_prompt": "move this below the title", "viewport": { "x": 0, "y": 0, "width": 1280, "height": 720, "zoom": 1 } }
+```
+
+---
+
 ## API Endpoints
 
 | Method | Endpoint | Description |
 |--------|----------|-------------|
-| `POST` | `/complete` | Trigger autocomplete (send `{ room_id }`) |
-| `POST` | `/complete/action` | Approve/reject/edit a pending change |
+| `POST` | `/complete` | Trigger autocomplete (send `{ room_id, viewport }`) |
+| `POST` | `/complete/action` | Approve/reject/edit a pending change (send current `viewport` for edit flows) |
 | `GET` | `/agents/{room_id}` | List agents in room and ensure `agent_0` exists |
 | `POST` | `/agents/{room_id}` | Create new chatbot agent |
-| `POST` | `/agent/{agent_id}/run` | Send chat message to agent |
+| `POST` | `/agent/{agent_id}/run` | Send chat message to agent (include `viewport` for generate mode) |
+| `POST` | `/agent/{agent_id}/action` | Approve/reject/edit a pending change generated by that agent |
 | `GET` | `/agent/{agent_id}/messages` | Get chat history timeline |
+
+Whenever an endpoint returns `change_id` or `new_change_id`, it now also returns `x` and `y` for that change. Use those coordinates to move the cursor or camera to the suggested canvas area.
 
 Full Swagger docs: `http://localhost:8000/docs`

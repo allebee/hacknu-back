@@ -71,10 +71,31 @@
 - Multiple chatbots can have pending changes simultaneously — each independently approvable
 
 ### 3. Approve / Reject / Edit Flow
-- `POST /complete/action` with `action: "approve" | "reject" | "edit"`
+- `POST /complete/action` with `action: "approve" | "reject" | "edit"` for autocomplete suggestions
+- `POST /agent/{agent_id}/action` with `action: "approve" | "reject" | "edit"` for chatbot suggestions
 - **Approve**: moves shapes from `pendingChanges` to `shapes` via JSON Patch
 - **Reject**: removes from `pendingChanges`, saves to DB so agent won't re-suggest
 - **Edit**: removes old suggestion, re-runs agent with user's edit prompt
+
+---
+
+## Viewport Payload
+
+For `/complete`, `/complete/action`, `/agent/{agent_id}/run`, and `/agent/{agent_id}/action`, the frontend should send the current visible canvas bounds so generation stays inside the current window:
+
+```json
+{
+  "viewport": {
+    "x": 0,
+    "y": 0,
+    "width": 1280,
+    "height": 720,
+    "zoom": 1
+  }
+}
+```
+
+`width` / `height` are the canonical fields. The backend also accepts `w` / `h` aliases.
 
 ---
 
@@ -82,11 +103,12 @@
 
 | Method | Endpoint | Description |
 |--------|----------|-------------|
-| `POST` | `/complete` | Autocomplete — generates ghost shapes after idle |
-| `POST` | `/complete/action` | Approve / reject / edit a pending change |
+| `POST` | `/complete` | Autocomplete — generates ghost shapes after idle; send `{ room_id, viewport }` |
+| `POST` | `/complete/action` | Approve / reject / edit a pending change; include `viewport` for edit flows |
 | `GET` | `/agents/{room_id}` | List agents in a room |
 | `POST` | `/agents/{room_id}` | Create a new chatbot agent |
-| `POST` | `/agent/{agent_id}/run` | Run chatbot (generate or query) |
+| `POST` | `/agent/{agent_id}/run` | Run chatbot (generate or query); include `viewport` when generating |
+| `POST` | `/agent/{agent_id}/action` | Approve / reject / edit a pending change created by that agent |
 | `GET` | `/agent/{agent_id}/messages` | Chat history timeline |
 | `GET` | `/health` | Health check |
 
