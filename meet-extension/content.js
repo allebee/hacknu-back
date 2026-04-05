@@ -9,7 +9,7 @@
   "use strict";
 
   const POLL_INTERVAL_MS = 2_000;
-  const BATCH_INTERVAL_MS = 10_000;
+  const BATCH_INTERVAL_MS = 5_000;
   const MIN_TEXT_LENGTH = 5;
 
   // Known Google Meet caption selectors (update if Google changes them)
@@ -136,25 +136,27 @@
   async function flushBuffer() {
     if (buffer.length === 0 || !config.roomId) return;
 
+    // Snapshot buffer but DON'T clear yet — only clear on success (retry-safe)
     const chunks = buffer.map((b) => ({ speaker: b.speaker, text: b.text }));
-    buffer = [];
-
     const url = `${config.backendUrl}/rooms/${encodeURIComponent(config.roomId)}/transcript`;
 
-    try {
-      const resp = await fetch(url, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ chunks }),
-      });
-      if (resp.ok) {
-        const data = await resp.json();
-        console.log(`[Canvas Meet Sync v4] Sent ${data.stored_count} chunks ✅`);
-      } else {
-        console.warn(`[Canvas Meet Sync v4] POST failed: ${resp.status}`);
+    // Send via background service worker to avoid cross-origin restrictions
+    chrome.runtime.sendMessage(
+      { type: "POST_TRANSCRIPT", url, chunks },
+      (response) => {
+        if (chrome.runtime.lastError) {
+          console.warn("[Canvas Meet Sync v4] Background error:", chrome.runtime.lastError.message);
+          return; // buffer kept, will retry next flush
+        }
+        if (response?.ok) {
+          // Success — now clear the sent chunks from buffer
+          buffer = buffer.slice(chunks.length);
+          console.log(`[Canvas Meet Sync v4] Sent ${response.stored_count} chunks ✅`);
+        } else {
+          console.warn(`[Canvas Meet Sync v4] POST failed: ${response?.status || response?.error}`);
+          // buffer kept, will retry next flush
+        }
       }
-    } catch (err) {
-      console.warn("[Canvas Meet Sync v4] Network error:", err.message);
-    }
+    );
   }
 })();
