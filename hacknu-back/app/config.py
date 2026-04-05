@@ -23,3 +23,6 @@ GEMINI_API_KEY: str = os.getenv("GEMINI_API", "")
 AGENT_PROVIDER: str = os.getenv("AGENT_PROVIDER", "openai").lower()
 AGENT_MODEL: str = os.getenv("AGENT_MODEL", "gpt-5.4")
 AI_DEBUG_PRINTS: bool = os.getenv("AI_DEBUG_PRINTS", "true").lower() in {"1", "true", "yes", "on"}
+
+HIGGSFIELD_API_KEY_ID: str = os.getenv("HIGGSFIELD_API_KEY_ID", "")
+HIGGSFIELD_API_KEY_SECRET: str = os.getenv("HIGGSFIELD_API_KEY_SECRET", "")

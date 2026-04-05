@@ -237,12 +237,29 @@ class GroupShape(TLBaseShape):
     props: dict = {}
 
 
+# ── Image ──────────────────────────────────────────────────────────────
+
+class ImageShapeProps(BaseModel):
+    w: float = 500
+    h: float = 350
+    assetId: str = ""
+    crop: dict | None = None
+    flipX: bool = False
+    flipY: bool = False
+
+
+class ImageShape(TLBaseShape):
+    type: Literal["image"] = "image"
+    props: ImageShapeProps = ImageShapeProps()
+
+
 # ── Discriminated Union ────────────────────────────────────────────────
 
 CanvasShape = Annotated[
     Union[
         GeoShape, ArrowShape, NoteShape, TextShape,
         FrameShape, LineShape, DrawShape, GroupShape,
+        ImageShape,
     ],
     Field(discriminator="type"),
 ]
@@ -257,4 +274,5 @@ SHAPE_TYPE_MAP: dict[str, type[TLBaseShape]] = {
     "line": LineShape,
     "draw": DrawShape,
     "group": GroupShape,
+    "image": ImageShape,
 }

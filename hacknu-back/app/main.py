@@ -10,6 +10,7 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from app.config import AGENT_PROVIDER, AGENT_MODEL
 from app.routes import complete_router, agents_router, agent_router, transcript_router
+from app.generate_routes import generate_router
 
 logging.basicConfig(
     level=logging.INFO,
@@ -46,6 +47,7 @@ app.include_router(complete_router)
 app.include_router(agents_router)
 app.include_router(agent_router)
 app.include_router(transcript_router)
+app.include_router(generate_router)
 
 
 @app.get("/health")

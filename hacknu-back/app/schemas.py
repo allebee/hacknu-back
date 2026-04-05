@@ -180,3 +180,41 @@ class TranscriptGetResponse(BaseModel):
 class TranscriptDeleteResponse(BaseModel):
     room_id: str
     deleted_count: int
+
+
+# ── Higgsfield Media Generation ────────────────────────────────────────
+
+class GenerateImageRequest(BaseModel):
+    room_id: str
+    shape_ids: list[str]
+    viewport: Viewport | None = None
+    user_hint: str = ""
+
+
+class GenerateImageResponse(BaseModel):
+    status: str  # "generating" | "skipped" | "completed" | "failed"
+    reason: str | None = None        # if skipped
+    request_id: str | None = None    # if generating/completed
+    prompt_used: str | None = None   # the LLM-crafted prompt
+    image_url: str | None = None     # if completed synchronously
+    shape_id: str | None = None      # tldraw shape id placed on canvas
+
+
+class GenerateVideoRequest(BaseModel):
+    room_id: str
+    image_url: str
+    prompt: str = ""
+    duration: int = 5
+
+
+class GenerateVideoResponse(BaseModel):
+    status: str
+    request_id: str | None = None
+    video_url: str | None = None
+
+
+class GenerateStatusResponse(BaseModel):
+    status: str
+    request_id: str
+    image_url: str | None = None
+    video_url: str | None = None
