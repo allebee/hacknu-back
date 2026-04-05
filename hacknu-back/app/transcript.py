@@ -13,8 +13,9 @@ from datetime import datetime, timedelta, timezone
 from sqlalchemy import select, delete
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.debug import debug_print
 from app.models import MeetingTranscript
-from app.planner import _get_client
+from app.planner import _chat_completion_token_limit_kwargs, _get_client
 
 logger = logging.getLogger(__name__)
 
@@ -30,6 +31,13 @@ async def store_chunks(
     chunks: list[dict],
 ) -> int:
     """Store transcript chunks from extension. Returns count stored."""
+    debug_print(
+        "transcript.store_chunks.received",
+        {
+            "room_id": room_id,
+            "chunks": chunks,
+        },
+    )
     entries = []
     for chunk in chunks:
         entry = MeetingTranscript(
@@ -41,6 +49,13 @@ async def store_chunks(
         db.add(entry)
     await db.commit()
     logger.info(f"[Transcript] Stored {len(entries)} chunks for room={room_id}")
+    debug_print(
+        "transcript.store_chunks.saved",
+        {
+            "room_id": room_id,
+            "stored_count": len(entries),
+        },
+    )
     return len(entries)
 
 
@@ -69,12 +84,34 @@ async def get_meeting_context(
         .order_by(MeetingTranscript.created_at)
     )
     entries = result.scalars().all()
+    debug_print(
+        "transcript.get_meeting_context.raw_entries",
+        {
+            "room_id": room_id,
+            "minutes": minutes,
+            "entries": entries,
+        },
+    )
 
     if not entries:
+        debug_print(
+            "transcript.get_meeting_context.return_value",
+            {
+                "room_id": room_id,
+                "context": None,
+            },
+        )
         return None
 
     # Deduplicate progressive captions (interim → final)
     entries = _dedup_progressive(entries)
+    debug_print(
+        "transcript.get_meeting_context.deduped_entries",
+        {
+            "room_id": room_id,
+            "entries": entries,
+        },
+    )
 
     parts = []
 
@@ -90,7 +127,15 @@ async def get_meeting_context(
         for e in recent:
             parts.append(f"  [{e.speaker}]: {e.text}")
 
-    return "\n".join(parts)
+    context = "\n".join(parts)
+    debug_print(
+        "transcript.get_meeting_context.return_value",
+        {
+            "room_id": room_id,
+            "context": context,
+        },
+    )
+    return context
 
 
 def _dedup_progressive(entries: list[MeetingTranscript]) -> list[MeetingTranscript]:
@@ -131,46 +176,83 @@ async def _get_or_create_summary(
     if room_id in _summary_cache:
         cached_summary, cached_time = _summary_cache[room_id]
         if now - cached_time < SUMMARY_TTL:
+            debug_print(
+                "transcript.get_or_create_summary.cache_hit",
+                {
+                    "room_id": room_id,
+                    "summary": cached_summary,
+                },
+            )
             return cached_summary
 
     # Need fewer than 5 entries? Skip summarization, raw is fine.
     if len(entries) < 5:
+        debug_print(
+            "transcript.get_or_create_summary.skipped",
+            {
+                "room_id": room_id,
+                "entry_count": len(entries),
+            },
+        )
         return None
 
     # Build raw text
     raw_lines = [f"[{e.speaker}]: {e.text}" for e in entries]
     raw_text = "\n".join(raw_lines)
+    debug_print(
+        "transcript.get_or_create_summary.raw_text",
+        {
+            "room_id": room_id,
+            "raw_text": raw_text,
+        },
+    )
 
     # Summarize
     try:
         summary = await _summarize(raw_text)
         _summary_cache[room_id] = (summary, now)
+        debug_print(
+            "transcript.get_or_create_summary.return_value",
+            {
+                "room_id": room_id,
+                "summary": summary,
+            },
+        )
         return summary
     except Exception as e:
         logger.error(f"[Transcript] Summarization failed: {e}")
+        debug_print("transcript.get_or_create_summary.error", e)
         return None
 
 
 async def _summarize(raw_text: str) -> str:
     """Compress transcript into bullet points via LLM."""
     client, model = _get_client()
-    response = await client.chat.completions.create(
-        model=model,
-        messages=[
+    system_prompt = (
+        "Summarize this meeting transcript into 5-8 concise bullet points. "
+        "Focus on: ideas proposed, decisions made, diagrams or flows mentioned, "
+        "action items, and key topics discussed. Be concise and actionable."
+    )
+    request_payload = {
+        "model": model,
+        "messages": [
             {
                 "role": "system",
-                "content": (
-                    "Summarize this meeting transcript into 5-8 concise bullet points. "
-                    "Focus on: ideas proposed, decisions made, diagrams or flows mentioned, "
-                    "action items, and key topics discussed. Be concise and actionable."
-                ),
+                "content": system_prompt,
             },
             {"role": "user", "content": raw_text},
         ],
-        temperature=0.2,
-        max_tokens=500,
-    )
-    return response.choices[0].message.content or ""
+        "temperature": 0.2,
+        **_chat_completion_token_limit_kwargs(500),
+    }
+    debug_print("transcript.summarize.system_prompt", system_prompt)
+    debug_print("transcript.summarize.user_input", raw_text)
+    debug_print("transcript.summarize.llm_payload", request_payload)
+    response = await client.chat.completions.create(**request_payload)
+    debug_print("transcript.summarize.llm_response", response)
+    summary = response.choices[0].message.content or ""
+    debug_print("transcript.summarize.return_value", summary)
+    return summary
 
 
 async def get_transcript_entries(
@@ -186,7 +268,7 @@ async def get_transcript_entries(
         .limit(limit)
     )
     entries = result.scalars().all()
-    return [
+    payload = [
         {
             "id": str(e.id),
             "speaker": e.speaker,
@@ -195,6 +277,15 @@ async def get_transcript_entries(
         }
         for e in reversed(entries)
     ]
+    debug_print(
+        "transcript.get_transcript_entries.return_value",
+        {
+            "room_id": room_id,
+            "limit": limit,
+            "entries": payload,
+        },
+    )
+    return payload
 
 
 async def clear_transcript(db: AsyncSession, room_id: str) -> int:
@@ -209,4 +300,11 @@ async def clear_transcript(db: AsyncSession, room_id: str) -> int:
 
     count = result.rowcount
     logger.info(f"[Transcript] Cleared {count} entries for room={room_id}")
+    debug_print(
+        "transcript.clear_transcript.return_value",
+        {
+            "room_id": room_id,
+            "deleted_count": count,
+        },
+    )
     return count

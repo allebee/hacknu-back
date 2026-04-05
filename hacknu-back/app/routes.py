@@ -16,6 +16,7 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.database import get_db
+from app.debug import debug_print
 from app.models import Agent, AgentChange, ChatMessage
 from app.schemas import (
     AgentInfo,
@@ -217,6 +218,7 @@ async def sync_agent_to_storage(room_id: str, agent: Agent) -> None:
 @complete_router.post("/complete", response_model=CompleteResponse)
 async def autocomplete(req: CompleteRequest, db: DbDep):
     """Autocomplete endpoint — triggered after idle. Uses the room's default agent."""
+    debug_print("routes.autocomplete.request", req.model_dump())
     agent = await ensure_default_agent(req.room_id, db)
     agent_id = agent.id
 
@@ -231,6 +233,14 @@ async def autocomplete(req: CompleteRequest, db: DbDep):
         storage = await liveblocks.get_storage(req.room_id)
     except Exception as e:
         raise HTTPException(status_code=502, detail=f"Failed to read storage: {e}")
+    debug_print(
+        "routes.autocomplete.storage",
+        {
+            "room_id": req.room_id,
+            "agent_id": agent_id,
+            "storage": storage,
+        },
+    )
 
     # Get rejected history
     result = await db.execute(
@@ -240,18 +250,35 @@ async def autocomplete(req: CompleteRequest, db: DbDep):
         .limit(10)
     )
     rejected = [{"reasoning": r.reasoning, "operations": r.operations} for r in result.scalars()]
+    debug_print("routes.autocomplete.rejected_history", rejected)
+
+    meeting_context = await get_meeting_context(db, req.room_id)
+    debug_print("routes.autocomplete.meeting_context", meeting_context)
 
     # Generate operations
     operations, reasoning = await generate_operations(
         storage,
         rejected_ops=rejected,
-        meeting_context=await get_meeting_context(db, req.room_id),
+        meeting_context=meeting_context,
         request_mode="autocomplete",
+    )
+    debug_print(
+        "routes.autocomplete.generated",
+        {
+            "operations": operations,
+            "reasoning": reasoning,
+        },
     )
 
     if not operations:
         await liveblocks.set_presence(req.room_id, agent_id, "idle", ttl=5)
-        return CompleteResponse(change_id="", operations_count=0, reasoning=reasoning or "No suggestions")
+        response = CompleteResponse(
+            change_id="",
+            operations_count=0,
+            reasoning=reasoning or "No suggestions",
+        )
+        debug_print("routes.autocomplete.response", response)
+        return response
 
     # Save to DB
     change_uuid, change_id = _new_change_identity()
@@ -269,7 +296,7 @@ async def autocomplete(req: CompleteRequest, db: DbDep):
     # Write to Liveblocks pendingChanges
     now = datetime.now(timezone.utc).isoformat()
     try:
-        await liveblocks.patch_storage(req.room_id, [
+        pending_change_payload = [
             {
                 "op": "add",
                 "path": f"/pendingChanges/{change_id}",
@@ -282,18 +309,22 @@ async def autocomplete(req: CompleteRequest, db: DbDep):
                     "createdAt": now,
                 },
             }
-        ])
+        ]
+        debug_print("routes.autocomplete.pending_change_payload", pending_change_payload)
+        await liveblocks.patch_storage(req.room_id, pending_change_payload)
     except Exception as e:
         logger.error(f"Failed to write pending change: {e}")
         raise HTTPException(status_code=502, detail=f"Storage write failed: {e}")
 
     await liveblocks.set_presence(req.room_id, agent_id, "suggested", ttl=10)
 
-    return CompleteResponse(
+    response = CompleteResponse(
         change_id=change_id,
         operations_count=len(operations),
         reasoning=reasoning,
     )
+    debug_print("routes.autocomplete.response", response)
+    return response
 
 
 # ───────────────────────────────────────────────────────────────────────
@@ -303,13 +334,22 @@ async def autocomplete(req: CompleteRequest, db: DbDep):
 @complete_router.post("/complete/action", response_model=CompleteActionResponse)
 async def complete_action(req: CompleteActionRequest, db: DbDep):
     """Approve, reject, or edit a pending change."""
+    debug_print("routes.complete_action.request", req.model_dump())
 
     try:
         storage = await liveblocks.get_storage(req.room_id)
     except Exception as e:
         raise HTTPException(status_code=502, detail=f"Failed to read storage: {e}")
+    debug_print(
+        "routes.complete_action.storage",
+        {
+            "room_id": req.room_id,
+            "storage": storage,
+        },
+    )
 
     pending_entry = _get_pending_change_entry(storage, req.change_id)
+    debug_print("routes.complete_action.pending_entry", pending_entry)
 
     # Find the change in DB
     result = await db.execute(
@@ -334,6 +374,16 @@ async def complete_action(req: CompleteActionRequest, db: DbDep):
     source_agent_id = (
         str(pending_entry.get("agentId")) if pending_entry and pending_entry.get("agentId")
         else (change.agent_id if change else _default_agent_id(req.room_id))
+    )
+    debug_print(
+        "routes.complete_action.source_state",
+        {
+            "change_id": req.change_id,
+            "source_operations": source_operations,
+            "source_reasoning": source_reasoning,
+            "source_agent_id": source_agent_id,
+            "matched_db_change_id": str(change.id) if change else None,
+        },
     )
 
     if req.action == "approve":
@@ -379,6 +429,7 @@ async def complete_action(req: CompleteActionRequest, db: DbDep):
                 raise HTTPException(status_code=409, detail="Pending change has no applicable operations")
 
             try:
+                debug_print("routes.complete_action.approve.patch_payload", ops_patch)
                 await liveblocks.patch_storage(req.room_id, ops_patch)
             except Exception as e:
                 logger.error(f"Approve patch failed: {e}")
@@ -389,7 +440,9 @@ async def complete_action(req: CompleteActionRequest, db: DbDep):
                 change.resolved_at = datetime.now(timezone.utc)
                 await db.commit()
 
-        return CompleteActionResponse(status="approved")
+        response = CompleteActionResponse(status="approved")
+        debug_print("routes.complete_action.response", response)
+        return response
 
     elif req.action == "reject":
         # Remove from Liveblocks
@@ -407,7 +460,9 @@ async def complete_action(req: CompleteActionRequest, db: DbDep):
             change.resolved_at = datetime.now(timezone.utc)
             await db.commit()
 
-        return CompleteActionResponse(status="rejected")
+        response = CompleteActionResponse(status="rejected")
+        debug_print("routes.complete_action.response", response)
+        return response
 
     elif req.action == "edit":
         if not req.edit_prompt:
@@ -434,21 +489,32 @@ async def complete_action(req: CompleteActionRequest, db: DbDep):
 
         # Re-run with edit context
         edit_user_prompt = _build_edit_user_prompt(req.edit_prompt, source_reasoning)
+        debug_print("routes.complete_action.edit_user_prompt", edit_user_prompt)
+        meeting_context = await get_meeting_context(db, req.room_id)
+        debug_print("routes.complete_action.meeting_context", meeting_context)
         operations, reasoning = await generate_operations(
             storage,
             user_prompt=edit_user_prompt,
             rejected_ops=[{"reasoning": source_reasoning, "operations": source_operations}] if source_operations or source_reasoning else None,
-            meeting_context=await get_meeting_context(db, req.room_id),
-            request_mode="chat_generate",
-            include_full_storage=True,
+            meeting_context=meeting_context,
+            request_mode="edit_suggestion",
+        )
+        debug_print(
+            "routes.complete_action.edited_generation",
+            {
+                "operations": operations,
+                "reasoning": reasoning,
+            },
         )
 
         if not operations:
-            return CompleteActionResponse(
+            response = CompleteActionResponse(
                 status="no_change",
                 reasoning=reasoning or "No canvas update was generated.",
                 operations_count=0,
             )
+            debug_print("routes.complete_action.response", response)
+            return response
 
         new_change_uuid, new_change_id = _new_change_identity()
         new_change = AgentChange(
@@ -463,7 +529,7 @@ async def complete_action(req: CompleteActionRequest, db: DbDep):
         await db.commit()
 
         now = datetime.now(timezone.utc).isoformat()
-        await liveblocks.patch_storage(req.room_id, [
+        pending_change_payload = [
             {
                 "op": "add",
                 "path": f"/pendingChanges/{new_change_id}",
@@ -476,14 +542,18 @@ async def complete_action(req: CompleteActionRequest, db: DbDep):
                     "createdAt": now,
                 },
             }
-        ])
+        ]
+        debug_print("routes.complete_action.edit.pending_change_payload", pending_change_payload)
+        await liveblocks.patch_storage(req.room_id, pending_change_payload)
 
-        return CompleteActionResponse(
+        response = CompleteActionResponse(
             status="edited",
             new_change_id=new_change_id,
             reasoning=reasoning,
             operations_count=len(operations),
         )
+        debug_print("routes.complete_action.response", response)
+        return response
 
     raise HTTPException(status_code=400, detail=f"Unknown action: {req.action}")
 
@@ -557,6 +627,13 @@ async def create_agent(room_id: str, req: CreateAgentRequest, db: DbDep):
 
 @agent_router.post("/agent/{agent_id}/run", response_model=AgentRunResponse)
 async def run_agent(agent_id: str, req: AgentRunRequest, db: DbDep):
+    debug_print(
+        "routes.run_agent.request",
+        {
+            "agent_id": agent_id,
+            "request": req.model_dump(),
+        },
+    )
     # Verify agent exists
     agent = await db.get(Agent, agent_id)
     if not agent:
@@ -567,6 +644,14 @@ async def run_agent(agent_id: str, req: AgentRunRequest, db: DbDep):
         storage = await liveblocks.get_storage(req.room_id)
     except Exception as e:
         raise HTTPException(status_code=502, detail=f"Failed to read storage: {e}")
+    debug_print(
+        "routes.run_agent.storage",
+        {
+            "room_id": req.room_id,
+            "agent_id": agent_id,
+            "storage": storage,
+        },
+    )
 
     # Get chat history
     result = await db.execute(
@@ -596,6 +681,7 @@ async def run_agent(agent_id: str, req: AgentRunRequest, db: DbDep):
             )
 
     # Save user message
+    debug_print("routes.run_agent.chat_history", chat_history)
     user_msg = ChatMessage(
         agent_id=agent_id,
         type="text",
@@ -605,10 +691,19 @@ async def run_agent(agent_id: str, req: AgentRunRequest, db: DbDep):
     db.add(user_msg)
 
     if req.mode == "query":
+        meeting_context = await get_meeting_context(db, req.room_id)
+        debug_print("routes.run_agent.query.meeting_context", meeting_context)
         answer, refs = await generate_query_answer(
             storage, req.prompt, chat_history,
-            meeting_context=await get_meeting_context(db, req.room_id),
+            meeting_context=meeting_context,
             include_full_storage=True,
+        )
+        debug_print(
+            "routes.run_agent.query.generated",
+            {
+                "answer": answer,
+                "referenced_shapes": refs,
+            },
         )
         assistant_msg = ChatMessage(
             agent_id=agent_id,
@@ -619,7 +714,9 @@ async def run_agent(agent_id: str, req: AgentRunRequest, db: DbDep):
         db.add(assistant_msg)
         await db.commit()
 
-        return AgentRunResponse(answer=answer, referenced_shapes=refs)
+        response = AgentRunResponse(answer=answer, referenced_shapes=refs)
+        debug_print("routes.run_agent.response", response)
+        return response
 
     # mode == "generate"
     # Get rejected history
@@ -630,17 +727,26 @@ async def run_agent(agent_id: str, req: AgentRunRequest, db: DbDep):
         .limit(10)
     )
     rejected = [{"reasoning": r.reasoning, "operations": r.operations} for r in rej_result.scalars()]
+    debug_print("routes.run_agent.rejected_history", rejected)
 
     await liveblocks.set_presence(req.room_id, agent_id, "thinking", ttl=30)
+    meeting_context = await get_meeting_context(db, req.room_id)
+    debug_print("routes.run_agent.generate.meeting_context", meeting_context)
 
     operations, reasoning = await generate_operations(
         storage,
         user_prompt=req.prompt,
         rejected_ops=rejected,
         chat_history=chat_history,
-        meeting_context=await get_meeting_context(db, req.room_id),
+        meeting_context=meeting_context,
         request_mode="chat_generate",
-        include_full_storage=True,
+    )
+    debug_print(
+        "routes.run_agent.generate.generated",
+        {
+            "operations": operations,
+            "reasoning": reasoning,
+        },
     )
 
     # Save assistant text reply
@@ -654,9 +760,11 @@ async def run_agent(agent_id: str, req: AgentRunRequest, db: DbDep):
 
     if not operations:
         await db.commit()
-        return AgentRunResponse(
+        response = AgentRunResponse(
             change_id=None, operations_count=0, reasoning=reasoning
         )
+        debug_print("routes.run_agent.response", response)
+        return response
 
     # Save change to DB
     change_uuid, change_id = _new_change_identity()
@@ -692,7 +800,7 @@ async def run_agent(agent_id: str, req: AgentRunRequest, db: DbDep):
     # Write to Liveblocks
     now = datetime.now(timezone.utc).isoformat()
     try:
-        await liveblocks.patch_storage(req.room_id, [
+        pending_change_payload = [
             {
                 "op": "add",
                 "path": f"/pendingChanges/{change_id}",
@@ -705,17 +813,21 @@ async def run_agent(agent_id: str, req: AgentRunRequest, db: DbDep):
                     "createdAt": now,
                 },
             }
-        ])
+        ]
+        debug_print("routes.run_agent.pending_change_payload", pending_change_payload)
+        await liveblocks.patch_storage(req.room_id, pending_change_payload)
     except Exception as e:
         logger.error(f"Failed to write pending change: {e}")
 
     await liveblocks.set_presence(req.room_id, agent_id, "suggested", ttl=10)
 
-    return AgentRunResponse(
+    response = AgentRunResponse(
         change_id=change_id,
         operations_count=len(operations),
         reasoning=reasoning,
     )
+    debug_print("routes.run_agent.response", response)
+    return response
 
 
 # ───────────────────────────────────────────────────────────────────────
@@ -766,9 +878,18 @@ async def get_messages(
 @transcript_router.post("/rooms/{room_id}/transcript", response_model=TranscriptPostResponse)
 async def post_transcript(room_id: str, req: TranscriptPostRequest, db: DbDep):
     """Receive transcript chunks from Chrome extension or manual paste."""
+    debug_print(
+        "routes.post_transcript.request",
+        {
+            "room_id": room_id,
+            "request": req.model_dump(),
+        },
+    )
     chunks = [c.model_dump() for c in req.chunks]
     count = await store_chunks(db, room_id, chunks)
-    return TranscriptPostResponse(room_id=room_id, stored_count=count)
+    response = TranscriptPostResponse(room_id=room_id, stored_count=count)
+    debug_print("routes.post_transcript.response", response)
+    return response
 
 
 @transcript_router.get("/rooms/{room_id}/transcript", response_model=TranscriptGetResponse)
@@ -776,16 +897,20 @@ async def get_transcript(room_id: str, db: DbDep):
     """Get transcript entries and summary for a room."""
     entries = await get_transcript_entries(db, room_id)
     summary = await get_meeting_context(db, room_id)
-    return TranscriptGetResponse(
+    response = TranscriptGetResponse(
         room_id=room_id,
         entry_count=len(entries),
         entries=entries,
         summary=summary,
     )
+    debug_print("routes.get_transcript.response", response)
+    return response
 
 
 @transcript_router.delete("/rooms/{room_id}/transcript", response_model=TranscriptDeleteResponse)
 async def delete_transcript(room_id: str, db: DbDep):
     """Clear all transcript data for a room."""
     count = await clear_transcript(db, room_id)
-    return TranscriptDeleteResponse(room_id=room_id, deleted_count=count)
+    response = TranscriptDeleteResponse(room_id=room_id, deleted_count=count)
+    debug_print("routes.delete_transcript.response", response)
+    return response

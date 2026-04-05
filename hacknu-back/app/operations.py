@@ -7,12 +7,13 @@ from __future__ import annotations
 from copy import deepcopy
 from dataclasses import dataclass
 import math
+import re
 import uuid
 
 from pydantic import ValidationError
 
 from app.schemas import ShapeOperation
-from app.shapes import ArrowShape, SHAPE_TYPE_MAP
+from app.shapes import ArrowShape, FrameShape, GeoShape, NoteShape, SHAPE_TYPE_MAP, TextShape
 
 AGENT_CONNECTION_META_KEY = "agentConnection"
 MIN_SHAPE_GAP = 40.0
@@ -21,6 +22,10 @@ DEFAULT_NOTE_HEIGHT = 200.0
 DEFAULT_TEXT_WIDTH = 200.0
 DEFAULT_TEXT_HEIGHT = 60.0
 MAX_CONNECTION_ENDPOINT_DISTANCE = 320.0
+DEFAULT_INSERT_X = 120.0
+DEFAULT_INSERT_Y = 120.0
+DEFAULT_AI_FONT = "sans"
+DEFAULT_AI_LABEL_COLOR = "black"
 ARROW_PROP_KEYS = {
     "start",
     "end",
@@ -55,6 +60,574 @@ class ConnectionSpec:
     end_shape_id: str
     start_anchor: dict[str, float]
     end_anchor: dict[str, float]
+
+
+@dataclass
+class IndexState:
+    next_number: int
+    used: set[str]
+
+
+def compile_draft_operations(storage: dict, operations: object) -> list[dict]:
+    """Compile high-level draft operations into concrete tldraw operations."""
+    raw_ops = [op for op in operations if isinstance(op, dict)] if isinstance(operations, list) else []
+    current_shapes = _storage_shapes(storage)
+    virtual_shapes = deepcopy(current_shapes)
+    ref_map = _build_ref_map(raw_ops, virtual_shapes)
+    index_state = _build_index_state(virtual_shapes)
+    compiled: list[dict] = []
+
+    for op_data in raw_ops:
+        compiled_op = _compile_draft_operation(op_data, virtual_shapes, ref_map, index_state)
+        if compiled_op is None:
+            continue
+        compiled.append(compiled_op)
+        _apply_virtual_operation(virtual_shapes, compiled_op)
+
+    return compiled
+
+
+def _compile_draft_operation(
+    op_data: dict,
+    virtual_shapes: dict[str, dict],
+    ref_map: dict[str, str],
+    index_state: IndexState,
+) -> dict | None:
+    op_name = op_data.get("op")
+
+    if op_name == "add_shape":
+        shape = op_data.get("shape")
+        if not isinstance(shape, dict):
+            return None
+        if _looks_like_concrete_shape(shape):
+            compiled_shape = _hydrate_legacy_shape(shape, op_data, virtual_shapes, ref_map, index_state)
+        else:
+            compiled_shape = _compile_semantic_add_shape(shape, op_data, virtual_shapes, ref_map, index_state)
+        if compiled_shape is None:
+            return None
+        return {"op": "add_shape", "shape": compiled_shape}
+
+    if op_name == "update_shape":
+        raw_shape_id = op_data.get("shapeId")
+        if not isinstance(raw_shape_id, str):
+            return None
+        shape_id = _resolve_shape_reference(raw_shape_id, ref_map)
+        updates = op_data.get("updates")
+        if not isinstance(shape_id, str) or not shape_id or not isinstance(updates, dict):
+            return None
+
+        current_shape = virtual_shapes.get(shape_id)
+        if not isinstance(current_shape, dict):
+            return None
+
+        compiled_updates = _compile_draft_updates(current_shape, updates, ref_map)
+        if not compiled_updates:
+            return None
+        return {
+            "op": "update_shape",
+            "shapeId": shape_id,
+            "updates": compiled_updates,
+        }
+
+    if op_name == "delete_shape":
+        raw_shape_id = op_data.get("shapeId")
+        if not isinstance(raw_shape_id, str):
+            return None
+        shape_id = _resolve_shape_reference(raw_shape_id, ref_map)
+        if not isinstance(shape_id, str) or not shape_id:
+            return None
+        return {"op": "delete_shape", "shapeId": shape_id}
+
+    return None
+
+
+def _build_ref_map(raw_ops: list[dict], virtual_shapes: dict[str, dict]) -> dict[str, str]:
+    used_ids = {
+        shape_id
+        for shape_id, shape in virtual_shapes.items()
+        if isinstance(shape_id, str) and isinstance(shape, dict)
+    }
+    ref_map: dict[str, str] = {}
+
+    for op_data in raw_ops:
+        if op_data.get("op") != "add_shape":
+            continue
+        shape = op_data.get("shape")
+        if not isinstance(shape, dict):
+            continue
+        ref = _draft_ref(op_data, shape)
+        if not ref:
+            continue
+
+        shape_id = shape.get("id")
+        if isinstance(shape_id, str) and shape_id:
+            used_ids.add(shape_id)
+            ref_map[ref] = shape_id
+            continue
+
+        ref_map[ref] = _allocate_shape_id(used_ids, ref)
+
+    return ref_map
+
+
+def _build_index_state(virtual_shapes: dict[str, dict]) -> IndexState:
+    used: set[str] = set()
+    max_numeric = 0
+
+    for shape in virtual_shapes.values():
+        if not isinstance(shape, dict):
+            continue
+        index = shape.get("index")
+        if not isinstance(index, str) or not index:
+            continue
+        used.add(index)
+        match = re.fullmatch(r"a(\d+)", index)
+        if match:
+            max_numeric = max(max_numeric, int(match.group(1)))
+
+    next_number = max_numeric + 1 if max_numeric else max(len(used) + 1, 1)
+    return IndexState(next_number=next_number, used=used)
+
+
+def _looks_like_concrete_shape(shape: dict) -> bool:
+    return any(
+        key in shape
+        for key in ("id", "props", "meta", "index", "parentId", "rotation", "opacity", "isLocked")
+    )
+
+
+def _hydrate_legacy_shape(
+    shape: dict,
+    op_data: dict,
+    virtual_shapes: dict[str, dict],
+    ref_map: dict[str, str],
+    index_state: IndexState,
+) -> dict:
+    hydrated = deepcopy(shape)
+    ref = _draft_ref(op_data, shape)
+    hydrated.pop("ref", None)
+    shape_id = hydrated.get("id")
+    if not isinstance(shape_id, str) or not shape_id:
+        hydrated["id"] = ref_map.get(ref) if ref else None
+    if not isinstance(hydrated.get("id"), str) or not hydrated["id"]:
+        hydrated["id"] = _allocate_shape_id(set(virtual_shapes) | set(ref_map.values()), ref)
+
+    hydrated.setdefault("x", DEFAULT_INSERT_X)
+    hydrated.setdefault("y", DEFAULT_INSERT_Y)
+    hydrated.setdefault("rotation", 0)
+    hydrated.setdefault("index", _allocate_index(index_state))
+    hydrated.setdefault("parentId", "page:page")
+    hydrated.setdefault("isLocked", False)
+    hydrated.setdefault("opacity", 1.0)
+    hydrated.setdefault("meta", {})
+    return hydrated
+
+
+def _compile_semantic_add_shape(
+    shape: dict,
+    op_data: dict,
+    virtual_shapes: dict[str, dict],
+    ref_map: dict[str, str],
+    index_state: IndexState,
+) -> dict | None:
+    shape_type = shape.get("type")
+    if not isinstance(shape_type, str):
+        return None
+
+    ref = _draft_ref(op_data, shape)
+    shape_id = ref_map.get(ref) if ref else None
+    if not shape_id:
+        shape_id = _allocate_shape_id(set(virtual_shapes) | set(ref_map.values()), ref)
+
+    if shape_type == "geo":
+        x, y = _shape_position(shape, virtual_shapes, ref_map, shape_type)
+        compiled = GeoShape(id=shape_id, x=x, y=y, index=_allocate_index(index_state)).model_dump(exclude_none=True)
+        props = compiled["props"]
+        props["font"] = DEFAULT_AI_FONT
+        props["labelColor"] = DEFAULT_AI_LABEL_COLOR
+        _set_geo_defaults_from_draft(props, shape)
+        return compiled
+
+    if shape_type == "note":
+        x, y = _shape_position(shape, virtual_shapes, ref_map, shape_type)
+        compiled = NoteShape(id=shape_id, x=x, y=y, index=_allocate_index(index_state)).model_dump(exclude_none=True)
+        props = compiled["props"]
+        props["font"] = DEFAULT_AI_FONT
+        props["labelColor"] = DEFAULT_AI_LABEL_COLOR
+        _set_note_defaults_from_draft(props, shape)
+        return compiled
+
+    if shape_type == "text":
+        x, y = _shape_position(shape, virtual_shapes, ref_map, shape_type)
+        compiled = TextShape(id=shape_id, x=x, y=y, index=_allocate_index(index_state)).model_dump(exclude_none=True)
+        props = compiled["props"]
+        props["font"] = DEFAULT_AI_FONT
+        _set_text_defaults_from_draft(props, shape)
+        return compiled
+
+    if shape_type == "frame":
+        x, y = _shape_position(shape, virtual_shapes, ref_map, shape_type)
+        compiled = FrameShape(id=shape_id, x=x, y=y, index=_allocate_index(index_state)).model_dump(exclude_none=True)
+        props = compiled["props"]
+        _set_frame_defaults_from_draft(props, shape)
+        return compiled
+
+    if shape_type == "arrow":
+        compiled = ArrowShape(id=shape_id, x=0, y=0, index=_allocate_index(index_state)).model_dump(exclude_none=True)
+        props = compiled["props"]
+        props["font"] = DEFAULT_AI_FONT
+        props["labelColor"] = DEFAULT_AI_LABEL_COLOR
+        _set_arrow_defaults_from_draft(compiled, shape, ref_map)
+        return compiled
+
+    return None
+
+
+def _compile_draft_updates(current_shape: dict, updates: dict, ref_map: dict[str, str]) -> dict:
+    compiled: dict = {}
+    for key in ("x", "y", "rotation", "index", "parentId", "isLocked", "opacity"):
+        if key in updates:
+            compiled[key] = deepcopy(updates[key])
+
+    if isinstance(updates.get("props"), dict):
+        compiled["props"] = deepcopy(updates["props"])
+    if isinstance(updates.get("meta"), dict):
+        compiled["meta"] = deepcopy(updates["meta"])
+
+    shape_type = current_shape.get("type")
+    props = compiled.setdefault("props", {})
+    if not isinstance(props, dict):
+        props = {}
+        compiled["props"] = props
+
+    if shape_type == "geo":
+        _apply_geo_update_semantics(props, updates)
+    elif shape_type == "note":
+        _apply_note_update_semantics(props, updates)
+    elif shape_type == "text":
+        _apply_text_update_semantics(props, updates)
+    elif shape_type == "frame":
+        _apply_frame_update_semantics(props, updates)
+    elif shape_type == "arrow":
+        _apply_arrow_update_semantics(compiled, props, updates, ref_map)
+
+    if "props" in compiled and not compiled["props"]:
+        compiled.pop("props")
+    if "meta" in compiled and not compiled["meta"]:
+        compiled.pop("meta")
+    return compiled
+
+
+def _draft_ref(op_data: dict, shape: dict) -> str | None:
+    for raw in (op_data.get("ref"), shape.get("ref")):
+        if isinstance(raw, str):
+            value = raw.strip()
+            if value:
+                return value
+    return None
+
+
+def _allocate_shape_id(used_ids: set[str], ref: str | None = None) -> str:
+    slug = _slugify(ref or "")
+    if slug:
+        candidate = f"shape:{slug}"
+        if candidate not in used_ids:
+            used_ids.add(candidate)
+            return candidate
+
+    while True:
+        candidate = f"shape:{uuid.uuid4().hex[:12]}"
+        if candidate not in used_ids:
+            used_ids.add(candidate)
+            return candidate
+
+
+def _allocate_index(index_state: IndexState) -> str:
+    while True:
+        candidate = f"a{index_state.next_number}"
+        index_state.next_number += 1
+        if candidate not in index_state.used:
+            index_state.used.add(candidate)
+            return candidate
+
+
+def _shape_position(
+    shape: dict,
+    virtual_shapes: dict[str, dict],
+    ref_map: dict[str, str],
+    shape_type: str,
+) -> tuple[float, float]:
+    explicit_x = shape.get("x")
+    explicit_y = shape.get("y")
+    if isinstance(explicit_x, (int, float)) and isinstance(explicit_y, (int, float)):
+        return float(explicit_x), float(explicit_y)
+
+    width, height = _draft_shape_dimensions(shape_type, shape)
+    near_shape_id = _resolve_shape_reference(shape.get("nearShapeId"), ref_map)
+    placement = shape.get("placement")
+    if isinstance(near_shape_id, str):
+        near_shape = virtual_shapes.get(near_shape_id)
+        if isinstance(near_shape, dict):
+            x, y = _position_near_shape(near_shape, width, height, placement)
+            if isinstance(explicit_x, (int, float)):
+                x = float(explicit_x)
+            if isinstance(explicit_y, (int, float)):
+                y = float(explicit_y)
+            return x, y
+
+    default_x, default_y = _default_insert_position(virtual_shapes, width, height)
+    if isinstance(explicit_x, (int, float)):
+        default_x = float(explicit_x)
+    if isinstance(explicit_y, (int, float)):
+        default_y = float(explicit_y)
+    return default_x, default_y
+
+
+def _draft_shape_dimensions(shape_type: str, shape: dict) -> tuple[float, float]:
+    if shape_type == "note":
+        return DEFAULT_NOTE_WIDTH, DEFAULT_NOTE_HEIGHT
+    if shape_type == "text":
+        return max(_as_float(shape.get("w"), DEFAULT_TEXT_WIDTH), 1.0), DEFAULT_TEXT_HEIGHT
+    if shape_type == "frame":
+        return max(_as_float(shape.get("w"), 400.0), 1.0), max(_as_float(shape.get("h"), 300.0), 1.0)
+    return max(_as_float(shape.get("w"), 200.0), 1.0), max(_as_float(shape.get("h"), 100.0), 1.0)
+
+
+def _position_near_shape(near_shape: dict, width: float, height: float, placement: object) -> tuple[float, float]:
+    bounds = _shape_bounds(near_shape)
+    if bounds is None:
+        center = _shape_center(near_shape)
+        return center["x"], center["y"]
+
+    direction = placement.strip().lower() if isinstance(placement, str) else "right"
+    if direction == "left":
+        return max(0.0, bounds.x - width - MIN_SHAPE_GAP), max(0.0, bounds.y + (bounds.h - height) / 2)
+    if direction == "above":
+        return max(0.0, bounds.x + (bounds.w - width) / 2), max(0.0, bounds.y - height - MIN_SHAPE_GAP)
+    if direction == "below":
+        return max(0.0, bounds.x + (bounds.w - width) / 2), bounds.y + bounds.h + MIN_SHAPE_GAP
+    if direction == "inside":
+        return bounds.x + MIN_SHAPE_GAP, bounds.y + MIN_SHAPE_GAP
+    return bounds.x + bounds.w + MIN_SHAPE_GAP, max(0.0, bounds.y + (bounds.h - height) / 2)
+
+
+def _default_insert_position(virtual_shapes: dict[str, dict], width: float, height: float) -> tuple[float, float]:
+    occupied = _occupied_bounds(virtual_shapes)
+    if not occupied:
+        return DEFAULT_INSERT_X, DEFAULT_INSERT_Y
+
+    max_right = max(item.x + item.w for item in occupied)
+    min_y = min(item.y for item in occupied)
+    x = max_right + MIN_SHAPE_GAP
+    y = min_y
+    if x + width > 1520:
+        x = DEFAULT_INSERT_X
+        y = max(item.y + item.h for item in occupied) + MIN_SHAPE_GAP
+    return x, y
+
+
+def _set_geo_defaults_from_draft(props: dict, shape: dict) -> None:
+    props["geo"] = _string_choice(shape.get("geo"), props["geo"])
+    props["w"] = max(_as_float(shape.get("w"), props["w"]), 1.0)
+    props["h"] = max(_as_float(shape.get("h"), props["h"]), 1.0)
+    _apply_common_style(props, shape, include_fill=True)
+    props["align"] = _string_choice(shape.get("align"), props["align"])
+    props["verticalAlign"] = _string_choice(shape.get("verticalAlign"), props["verticalAlign"])
+    props["richText"] = _rich_text_from_shape(shape)
+
+
+def _set_note_defaults_from_draft(props: dict, shape: dict) -> None:
+    _apply_common_style(props, shape, include_fill=False)
+    props["align"] = _string_choice(shape.get("align"), props["align"])
+    props["verticalAlign"] = _string_choice(shape.get("verticalAlign"), props["verticalAlign"])
+    props["richText"] = _rich_text_from_shape(shape)
+
+
+def _set_text_defaults_from_draft(props: dict, shape: dict) -> None:
+    props["color"] = _string_choice(shape.get("color"), props["color"])
+    props["size"] = _string_choice(shape.get("size"), props["size"])
+    props["font"] = _string_choice(shape.get("font"), props["font"])
+    props["textAlign"] = _string_choice(shape.get("textAlign"), props["textAlign"])
+    props["w"] = max(_as_float(shape.get("w"), props["w"]), 1.0)
+    if isinstance(shape.get("autoSize"), bool):
+        props["autoSize"] = shape["autoSize"]
+    props["richText"] = _rich_text_from_shape(shape)
+
+
+def _set_frame_defaults_from_draft(props: dict, shape: dict) -> None:
+    props["w"] = max(_as_float(shape.get("w"), props["w"]), 1.0)
+    props["h"] = max(_as_float(shape.get("h"), props["h"]), 1.0)
+    props["color"] = _string_choice(shape.get("color"), props["color"])
+    if isinstance(shape.get("name"), str):
+        props["name"] = shape["name"]
+
+
+def _set_arrow_defaults_from_draft(compiled: dict, shape: dict, ref_map: dict[str, str]) -> None:
+    props = compiled["props"]
+    _apply_common_style(props, shape, include_fill=True)
+    props["kind"] = _string_choice(shape.get("kind"), props["kind"])
+    props["arrowheadStart"] = _string_choice(shape.get("arrowheadStart"), props["arrowheadStart"])
+    props["arrowheadEnd"] = _string_choice(shape.get("arrowheadEnd"), props["arrowheadEnd"])
+    label = _shape_label(shape)
+    if label:
+        props["richText"] = _rich_text(label)
+
+    start_shape_id = _resolve_shape_reference(shape.get("startShapeId"), ref_map)
+    end_shape_id = _resolve_shape_reference(shape.get("endShapeId"), ref_map)
+    if isinstance(start_shape_id, str) and isinstance(end_shape_id, str) and start_shape_id != end_shape_id:
+        compiled["meta"][AGENT_CONNECTION_META_KEY] = {
+            "startShapeId": start_shape_id,
+            "endShapeId": end_shape_id,
+            "startAnchor": {"x": 0.5, "y": 0.5},
+            "endAnchor": {"x": 0.5, "y": 0.5},
+        }
+    else:
+        if isinstance(shape.get("x"), (int, float)):
+            compiled["x"] = float(shape["x"])
+        if isinstance(shape.get("y"), (int, float)):
+            compiled["y"] = float(shape["y"])
+        if isinstance(shape.get("start"), dict):
+            props["start"] = _point(shape["start"])
+        if isinstance(shape.get("end"), dict):
+            props["end"] = _point(shape["end"])
+
+
+def _apply_common_style(props: dict, source: dict, *, include_fill: bool) -> None:
+    props["color"] = _string_choice(source.get("color"), props.get("color", "black"))
+    if include_fill and "fill" in props:
+        props["fill"] = _string_choice(source.get("fill"), props["fill"])
+    if "dash" in props:
+        props["dash"] = _string_choice(source.get("dash"), props["dash"])
+    props["size"] = _string_choice(source.get("size"), props.get("size", "m"))
+    props["font"] = _string_choice(source.get("font"), props.get("font", DEFAULT_AI_FONT))
+    if "labelColor" in props:
+        props["labelColor"] = _string_choice(source.get("labelColor"), props["labelColor"])
+
+
+def _apply_geo_update_semantics(props: dict, updates: dict) -> None:
+    if "geo" in updates:
+        props["geo"] = updates["geo"]
+    if "w" in updates:
+        props["w"] = max(_as_float(updates["w"]), 1.0)
+    if "h" in updates:
+        props["h"] = max(_as_float(updates["h"]), 1.0)
+    for key in ("color", "fill", "dash", "size", "font", "align", "verticalAlign", "labelColor"):
+        if key in updates:
+            props[key] = updates[key]
+    label = _shape_label(updates)
+    if label is not None:
+        props["richText"] = _rich_text(label)
+
+
+def _apply_note_update_semantics(props: dict, updates: dict) -> None:
+    for key in ("color", "size", "font", "align", "verticalAlign", "labelColor"):
+        if key in updates:
+            props[key] = updates[key]
+    label = _shape_label(updates)
+    if label is not None:
+        props["richText"] = _rich_text(label)
+
+
+def _apply_text_update_semantics(props: dict, updates: dict) -> None:
+    for key in ("color", "size", "font", "textAlign"):
+        if key in updates:
+            props[key] = updates[key]
+    if "w" in updates:
+        props["w"] = max(_as_float(updates["w"]), 1.0)
+    if "autoSize" in updates and isinstance(updates["autoSize"], bool):
+        props["autoSize"] = updates["autoSize"]
+    label = _shape_label(updates)
+    if label is not None:
+        props["richText"] = _rich_text(label)
+
+
+def _apply_frame_update_semantics(props: dict, updates: dict) -> None:
+    for key in ("color", "name"):
+        if key in updates:
+            props[key] = updates[key]
+    if "w" in updates:
+        props["w"] = max(_as_float(updates["w"]), 1.0)
+    if "h" in updates:
+        props["h"] = max(_as_float(updates["h"]), 1.0)
+
+
+def _apply_arrow_update_semantics(compiled: dict, props: dict, updates: dict, ref_map: dict[str, str]) -> None:
+    for key in (
+        "color",
+        "fill",
+        "dash",
+        "size",
+        "font",
+        "kind",
+        "arrowheadStart",
+        "arrowheadEnd",
+        "labelColor",
+        "labelPosition",
+    ):
+        if key in updates:
+            props[key] = updates[key]
+    if "start" in updates:
+        props["start"] = _point(updates["start"])
+    if "end" in updates:
+        props["end"] = _point(updates["end"])
+    label = _shape_label(updates)
+    if label is not None:
+        props["richText"] = _rich_text(label)
+
+    start_shape_id = _resolve_shape_reference(updates.get("startShapeId"), ref_map)
+    end_shape_id = _resolve_shape_reference(updates.get("endShapeId"), ref_map)
+    if isinstance(start_shape_id, str) and isinstance(end_shape_id, str) and start_shape_id != end_shape_id:
+        meta = compiled.setdefault("meta", {})
+        meta[AGENT_CONNECTION_META_KEY] = {
+            "startShapeId": start_shape_id,
+            "endShapeId": end_shape_id,
+            "startAnchor": {"x": 0.5, "y": 0.5},
+            "endAnchor": {"x": 0.5, "y": 0.5},
+        }
+
+
+def _shape_label(shape: dict) -> str | None:
+    for key in ("label", "text", "name"):
+        value = shape.get(key)
+        if isinstance(value, str):
+            return value
+    return None
+
+
+def _rich_text_from_shape(shape: dict) -> dict:
+    label = _shape_label(shape) or ""
+    return _rich_text(label)
+
+
+def _rich_text(text: str) -> dict:
+    paragraph: dict = {"type": "paragraph"}
+    if text:
+        paragraph["content"] = [{"type": "text", "text": text}]
+    return {"type": "doc", "content": [paragraph]}
+
+
+def _resolve_shape_reference(value: object, ref_map: dict[str, str]) -> str | None:
+    if not isinstance(value, str):
+        return None
+    raw = value.strip()
+    if not raw:
+        return None
+    if raw.startswith("shape:"):
+        return raw
+    if raw.startswith("ref:"):
+        return ref_map.get(raw[4:].strip())
+    return ref_map.get(raw, raw)
+
+
+def _slugify(value: str) -> str:
+    slug = re.sub(r"[^a-z0-9]+", "_", value.lower()).strip("_")
+    return slug[:40]
+
+
+def _string_choice(value: object, default: str) -> str:
+    if isinstance(value, str) and value:
+        return value
+    return default
 
 
 def normalize_generated_operations(storage: dict, operations: object) -> list[dict]:

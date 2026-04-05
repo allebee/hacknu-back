@@ -2,10 +2,86 @@ from __future__ import annotations
 
 import unittest
 
-from app.operations import AGENT_CONNECTION_META_KEY, normalize_generated_operations, sanitize_operations_for_apply
+from app.operations import (
+    AGENT_CONNECTION_META_KEY,
+    compile_draft_operations,
+    normalize_generated_operations,
+    sanitize_operations_for_apply,
+)
 
 
 class OperationNormalizationTests(unittest.TestCase):
+    def test_compiles_semantic_note_with_backend_defaults(self) -> None:
+        compiled = compile_draft_operations(
+            {"shapes": {}},
+            [
+                {
+                    "op": "add_shape",
+                    "ref": "next_step",
+                    "shape": {
+                        "type": "note",
+                        "label": "Capture risks",
+                    },
+                }
+            ],
+        )
+
+        shape = compiled[0]["shape"]
+
+        self.assertTrue(shape["id"].startswith("shape:"))
+        self.assertEqual(shape["index"], "a1")
+        self.assertEqual(shape["parentId"], "page:page")
+        self.assertEqual(shape["props"]["font"], "sans")
+        self.assertEqual(
+            shape["props"]["richText"],
+            {"type": "doc", "content": [{"type": "paragraph", "content": [{"type": "text", "text": "Capture risks"}]}]},
+        )
+
+    def test_compiles_arrow_from_local_refs(self) -> None:
+        compiled = compile_draft_operations(
+            {"shapes": {}},
+            [
+                {
+                    "op": "add_shape",
+                    "ref": "left",
+                    "shape": {
+                        "type": "note",
+                        "label": "Start",
+                        "x": 100,
+                        "y": 100,
+                    },
+                },
+                {
+                    "op": "add_shape",
+                    "ref": "right",
+                    "shape": {
+                        "type": "note",
+                        "label": "Finish",
+                        "x": 500,
+                        "y": 100,
+                    },
+                },
+                {
+                    "op": "add_shape",
+                    "shape": {
+                        "type": "arrow",
+                        "label": "flows",
+                        "startShapeId": "ref:left",
+                        "endShapeId": "ref:right",
+                    },
+                },
+            ],
+        )
+
+        normalized = normalize_generated_operations({"shapes": {}}, compiled)
+        left_id = normalized[0]["shape"]["id"]
+        right_id = normalized[1]["shape"]["id"]
+        arrow = normalized[2]["shape"]
+
+        self.assertEqual(arrow["meta"][AGENT_CONNECTION_META_KEY]["startShapeId"], left_id)
+        self.assertEqual(arrow["meta"][AGENT_CONNECTION_META_KEY]["endShapeId"], right_id)
+        self.assertEqual(arrow["props"]["richText"]["content"][0]["content"][0]["text"], "flows")
+
     def test_reflows_new_note_away_from_existing_note(self) -> None:
         storage = {
             "shapes": {
@@ -236,6 +312,31 @@ class OperationNormalizationTests(unittest.TestCase):
         self.assertEqual(updates["props"]["end"], {"x": 400.0, "y": 0.0})
         self.assertEqual(updates["x"], 200.0)
         self.assertNotIn("y", updates)
+
+    def test_compiles_semantic_update_for_existing_shape(self) -> None:
+        storage = {"shapes": {"shape:note": _note("shape:note", 100, 100)}}
+        compiled = compile_draft_operations(
+            storage,
+            [
+                {
+                    "op": "update_shape",
+                    "shapeId": "shape:note",
+                    "updates": {
+                        "label": "Renamed note",
+                        "color": "green",
+                    },
+                }
+            ],
+        )
+
+        normalized = normalize_generated_operations(storage, compiled)
+        updates = normalized[0]["updates"]["props"]
+
+        self.assertEqual(updates["color"], "green")
+        self.assertEqual(
+            updates["richText"],
+            {"type": "doc", "content": [{"type": "paragraph", "content": [{"type": "text", "text": "Renamed note"}]}]},
+        )
 
 
 def _note(shape_id: str, x: float, y: float) -> dict:
